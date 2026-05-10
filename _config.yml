@@ -1,0 +1,5 @@
+theme: jekyll-theme-slate
+title: SystemDesign
+description: Notes on System Design and Distributed Systems
+url: https://rahulbitssharma.github.io/SystemDesign
+baseurl: /SystemDesign
