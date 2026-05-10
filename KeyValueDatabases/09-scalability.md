@@ -339,3 +339,4 @@ They are not a replacement for relational databases when you need complex querie
 **Navigation:**
 - [← Previous: Architecture Diagrams](08-architecture-diagrams.md)
 - [Back to Index](README.md)
+- [Next: Fault Tolerance →](10-fault-tolerance.md)

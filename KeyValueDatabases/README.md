@@ -13,6 +13,7 @@ A comprehensive guide to understanding, implementing, and scaling key-value data
 7. **[Real-World Use Cases](07-use-cases.md)** — Session management, rate limiting, leaderboards, pub/sub, feature flags, and configuration stores.
 8. **[Architecture Diagrams](08-architecture-diagrams.md)** — Single-node, distributed clusters, write/read workflows, and replication patterns.
 9. **[Scalability and Performance](09-scalability.md)** — Why SQL databases struggle to scale, horizontal partitioning, denormalisation, and detailed E-commerce examples.
+10. **[Fault Tolerance](10-fault-tolerance.md)** — How KV stores and SQL databases handle failures. Replication, quorum writes, failover strategies, case studies (Twitter, Stripe, Netflix), and scenario-based trade-offs.
 
 ---
 
@@ -25,6 +26,8 @@ A comprehensive guide to understanding, implementing, and scaling key-value data
 **Looking for implementation details?** See [Popular Implementations](05-implementations.md) and [Building a Caching System](06-caching-example.md).
 
 **Scaling a distributed system?** Read [Scalability and Performance](09-scalability.md) for deep dives into sharding, consistency, and real-world trade-offs.
+
+**Concerned about reliability?** Read [Fault Tolerance](10-fault-tolerance.md) to understand how KV stores and relational databases handle failures, with real case studies (Twitter, Stripe, Netflix).
 
 ---
 
