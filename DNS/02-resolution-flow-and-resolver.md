@@ -28,6 +28,32 @@ When people say "DNS resolver" in production architecture, they usually mean the
 - **Recursive query**: Client asks resolver "give me final answer".
 - **Iterative query**: Resolver asks nameservers and gets referrals until it reaches authority.
 
+### Why It Is Called a Recursive Resolver
+
+The resolver is called "recursive" because of the service contract it offers to clients, not because every upstream hop is recursive.
+
+- Stub/host sends query with recursion desired.
+- Recursive resolver takes full responsibility for returning a final answer (or final error).
+- Internally, that resolver usually performs iterative queries to root, TLD, and authoritative servers.
+
+So both statements are true at once: client->resolver interaction is recursive; resolver->upstream interaction is usually iterative.
+
+## How Browser Requests Reach a DNS Resolver
+
+When a browser needs `www.example.com`, name resolution usually flows like this:
+
+1. Browser asks OS networking APIs to resolve the hostname (for example, via `getaddrinfo`-style calls).
+2. OS stub resolver checks local sources/caches and then queries configured recursive resolver(s).
+3. Recursive resolver returns answer to OS, and OS returns it to the browser.
+
+Who configures which recursive resolver is used?
+
+- Commonly the OS/network stack via DHCP-provided DNS servers from router/ISP, or manual/enterprise policy settings.
+- Not directly "the internet" deciding per request.
+- Browser code initiates lookup, but resolver choice is typically owned by OS/network configuration.
+
+Important exception: if browser DNS-over-HTTPS is enabled, browser may send DNS directly to its configured DoH provider instead of OS-configured UDP/TCP resolver path.
+
 ## Why Recursive Resolvers Are Critical
 
 - Reduce latency through shared cache hits.

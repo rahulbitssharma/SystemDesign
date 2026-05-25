@@ -32,6 +32,16 @@ example.com.      NS   ns1.example.com.
 ns1.example.com.  A    203.0.113.53   ; glue in parent if required
 ```
 
+## Where Zone Data Is Stored
+
+Authoritative nameservers serve zone data, but storage format depends on implementation:
+
+- Classic DNS servers (for example BIND/NSD/Knot) commonly load zone text files (master files).
+- Some authoritative platforms compile/transfer those files into optimized binary or in-memory structures.
+- Managed DNS providers often store zone state in distributed databases and generate serving data from that state.
+
+So yes, it can be a file, but it is not required to be a file in all systems. The protocol only cares about authoritative answers, not the backend format.
+
 ## Diagram: Hierarchy
 
 ```text

@@ -21,6 +21,63 @@ Usually `CLASS` is `IN` (Internet).
 - **PTR**: Reverse DNS (IP -> name)
 - **CAA**: Which certificate authorities may issue TLS certs
 
+## Deep Dive: CNAME, NS, and MX
+
+### CNAME (Canonical Name)
+
+- A `CNAME` makes one name an alias of another name.
+- Resolver behavior: when it gets a CNAME answer, it restarts lookup for the target name and then returns the final A/AAAA (or other requested type) answer.
+- Constraint: an owner name with `CNAME` cannot also have other records like `A`, `AAAA`, `MX`, or `TXT` at that same owner name.
+- Operational note: this is why zone apex (`example.com`) is usually not a CNAME in classic DNS setups; apex often needs `NS`, `SOA`, and sometimes `MX`.
+
+Example:
+
+```dns
+www     IN CNAME app-lb.example.net.
+```
+
+`www.example.com` is an alias, and `app-lb.example.net` holds the real address records.
+
+### NS (Name Server)
+
+- `NS` records define which authoritative nameservers serve a zone.
+- At parent/child boundaries, NS records represent delegation (for example, `.com` delegates `example.com` to that domain's authoritative NS set).
+- Inside a zone apex, NS records publish that zone's authoritative servers.
+- If NS hostnames are inside the delegated child zone, parent zone often must include glue A/AAAA records.
+
+Example:
+
+```dns
+@       IN NS   ns1.example.com.
+@       IN NS   ns2.example.com.
+```
+
+### MX (Mail Exchanger)
+
+- `MX` records tell senders where to deliver email for a domain.
+- Each MX has a preference number; lower value means higher priority.
+- Mail transfer agents try the lowest-preference reachable target first, then fail over to higher numbers.
+- MX targets should resolve to A/AAAA records (not CNAME targets), to avoid ambiguous delivery behavior.
+
+Example:
+
+```dns
+@       IN MX 10 mail1.example.com.
+@       IN MX 20 mail2.example.com.
+```
+
+## What Is a Zone Snippet?
+
+A zone snippet is a partial text extract from a zone's authoritative data, usually written in zone-file syntax. It is not a separate DNS concept on the wire; it is just a human-editable representation of DNS records.
+
+In practice, the same logical zone data can be stored in different backends:
+
+- Flat zone files (common in BIND-style authoritative setups)
+- Databases (SQL/NoSQL) in managed DNS/control-plane systems
+- In-memory/generated data structures in custom authoritative services
+
+So, a "zone snippet" is typically shown as text, but production storage may or may not be a literal file.
+
 ## Example Zone Snippet
 
 ```dns
