@@ -4,3 +4,4 @@ This repository hosts my notes on a myriad of topics - System Design examples, D
 ## Topics
 
 - [Key-Value Databases](KeyValueDatabases/)
+- [DNS](DNS/)
