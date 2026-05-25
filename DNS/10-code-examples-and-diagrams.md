@@ -95,6 +95,29 @@ dig www.github.com A +noall +answer
 
 # Reverse lookup
 dig -x 8.8.8.8 +noall +answer
+
+# Force TCP instead of UDP
+dig example.com A +tcp
+
+# Show if UDP response was truncated (look for "tc" flag)
+dig dnssec-failed.org DNSKEY +dnssec
+
+# Query a DoH endpoint over HTTPS (wire transport is HTTPS/TLS)
+curl -sS -H 'accept: application/dns-json' \
+  'https://dns.google/resolve?name=example.com&type=A'
+```
+
+## Packet Shape Quick View
+
+```text
+UDP DNS packet:
+[IP][UDP][DNS Header][Question][Answer...]
+
+TCP DNS packet:
+[IP][TCP][2-byte DNS length][DNS Header][Question][Answer...]
+
+DoH packet stream:
+[IP][TCP/QUIC][TLS][HTTP][DNS message payload]
 ```
 
 ---
