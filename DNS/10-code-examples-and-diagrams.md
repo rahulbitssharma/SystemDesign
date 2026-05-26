@@ -32,6 +32,60 @@ for rdata in resolver.resolve("google.com", "NS"):
     print("NS:", rdata.to_text())
 ```
 
+## Pseudo-Code: Browser DNS Path Selection
+
+```javascript
+async function resolveForNavigation(hostname) {
+  const cached = browserDnsCache.get(hostname);
+  if (cached && !cached.isExpired()) return cached.addresses;
+
+  const dohMode = settings.secureDnsMode; // off | automatic | strict
+  const dohEndpoint = settings.dohEndpoint;
+
+  if (dohMode !== "off") {
+    const canUseDoh = await dohPolicyAllows(hostname, dohEndpoint);
+    if (canUseDoh) {
+      try {
+        const answer = await resolveViaDoh(hostname, dohEndpoint);
+        browserDnsCache.put(hostname, answer.addresses, answer.ttlSeconds);
+        return answer.addresses;
+      } catch (err) {
+        if (dohMode === "strict") throw new Error("DoH failed in strict mode");
+      }
+    }
+  }
+
+  // Fallback path: use OS resolver APIs.
+  const osAnswer = await osResolverGetAddrInfo(hostname);
+  browserDnsCache.put(hostname, osAnswer.addresses, osAnswer.ttlSeconds);
+  return osAnswer.addresses;
+}
+```
+
+## Pseudo-Code: DoH Query and TLS Validation Flow
+
+```javascript
+async function resolveViaDoh(hostname, endpoint) {
+  // TLS handshake happens during HTTPS connection setup.
+  // Certificate validation includes hostname + trust chain checks.
+  const queryWire = buildDnsWireQuery({ name: hostname, type: "A" });
+
+  const resp = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/dns-message",
+      "accept": "application/dns-message"
+    },
+    body: queryWire
+  });
+
+  if (!resp.ok) throw new Error(`DoH failed: ${resp.status}`);
+
+  const answerWire = new Uint8Array(await resp.arrayBuffer());
+  return parseDnsWireResponse(answerWire);
+}
+```
+
 ## Sequence Diagram (Conceptual)
 
 ```text
