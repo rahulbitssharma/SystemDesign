@@ -86,6 +86,49 @@ async function resolveViaDoh(hostname, endpoint) {
 }
 ```
 
+  ## Pseudo-Code: HTTPS Over TCP Socket Lifecycle
+
+  ```python
+  def https_request(hostname: str, ip: str, request_bytes: bytes) -> bytes:
+    # 1) Open TCP socket via OS networking stack.
+    sock = os_socket(AF_INET, SOCK_STREAM)
+    os_connect(sock, (ip, 443))
+
+    # 2) Wrap socket with TLS context in user-space (or platform TLS library).
+    tls = tls_context(server_name=hostname, verify_cert=True)
+    tls_conn = tls.wrap_socket(sock)
+
+    # 3) TLS handshake exchanges certificates and session keys.
+    tls_conn.handshake()
+
+    # 4) App writes plaintext HTTP; TLS emits encrypted records.
+    tls_conn.write(request_bytes)
+
+    # 5) OS returns encrypted socket bytes; TLS decrypts before app reads.
+    response_plaintext = tls_conn.read_all()
+    return response_plaintext
+  ```
+
+  ## Pseudo-Code: Browser Navigation with DoH + HTTPS
+
+  ```python
+  def navigate(url: str):
+    host = parse_host(url)
+
+    # DNS phase
+    if browser_settings.secure_dns_mode in ("automatic", "strict"):
+      dns_answer = resolve_via_doh(host)
+    else:
+      dns_answer = os_getaddrinfo(host)
+
+    target_ip = happy_eyeballs_select(dns_answer.addresses)
+
+    # Content phase: separate HTTPS session to website origin.
+    req = build_http_get(url)
+    page = https_request(host, target_ip, req)
+    return page
+  ```
+
 ## Sequence Diagram (Conceptual)
 
 ```text
@@ -172,6 +215,35 @@ TCP DNS packet:
 
 DoH packet stream:
 [IP][TCP/QUIC][TLS][HTTP][DNS message payload]
+```
+
+## Packet Flow: HTTPS and DoH Side-by-Side
+
+```text
+HTTPS to website (content):
+Browser app data: HTTP request
+  -> TLS record encrypt
+    -> TCP segment
+      -> IP packet
+        -> network
+
+DoH to resolver (DNS):
+Browser app data: DNS wire query in HTTP body
+  -> TLS record encrypt
+    -> TCP segment (or QUIC datagram for HTTP/3)
+      -> IP packet
+        -> network
+```
+
+## What OS Delivers to Browser Process
+
+```text
+Before TLS starts:
+- OS socket recv returns plaintext TLS handshake bytes from peer.
+
+After TLS starts (typical user-space TLS):
+- OS socket recv returns encrypted TLS records.
+- TLS library in browser decrypts and returns plaintext HTTP bytes to app code.
 ```
 
 ---

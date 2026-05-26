@@ -68,6 +68,40 @@ Modern encrypted DNS options:
 
 So HTTPS can be used for DNS, but only when DoH is explicitly used by browser, OS, or resolver policy.
 
+## DoH vs DoT: Key Differences
+
+Both encrypt DNS, but they differ in encapsulation and operational behavior.
+
+| Dimension | DoH | DoT |
+|---|---|---|
+| Transport | HTTPS (HTTP/2 or HTTP/3) | TLS over TCP |
+| Typical port | 443 | 853 |
+| Payload shape | DNS message inside HTTP request/response | Raw DNS message inside TLS stream |
+| Visibility to middleboxes | Looks like general HTTPS traffic | Clearly DNS-over-TLS traffic |
+| Browser adoption | Very common in modern browsers | Less common directly in browsers |
+| Common use | Browser secure DNS, privacy over web path | OS/resolver-to-resolver encrypted DNS |
+
+Example choice in practice:
+
+- Browser wants DNS privacy and easy deployment through existing HTTPS infrastructure: uses DoH endpoint like `https://dns.example.net/dns-query`.
+- Enterprise resolver encrypts upstream DNS between resolvers with explicit DNS transport identity: often uses DoT on port 853.
+
+## Packet Flow Example: DoH vs DoT
+
+DoH flow (simplified):
+
+1. Client -> DoH server: TCP or QUIC connect (usually 443)
+2. TLS handshake + certificate validation
+3. HTTP request carrying DNS query bytes
+4. HTTP response carrying DNS answer bytes
+
+DoT flow (simplified):
+
+1. Client -> DoT server: TCP connect on 853
+2. TLS handshake + certificate validation
+3. DNS query bytes over TLS stream (no HTTP layer)
+4. DNS response bytes over TLS stream
+
 ## Is DoH Default in Modern Browsers?
 
 Short answer: often "automatic by default" in modern browsers, but not always "strictly on" for every network.
@@ -118,6 +152,54 @@ Path B: DoH disabled or unavailable
 4. Browser connects to destination origin.
 
 Important nuance: exact low-level system calls differ across engines and platforms, but this decision split (browser DoH path vs OS resolver path) is the key architecture.
+
+## How HTTPS Works Over TCP (And What OS Does)
+
+At a high level, HTTPS is HTTP carried inside TLS, and TLS is carried over TCP (or over QUIC for HTTP/3). For HTTP/1.1 and HTTP/2, the usual stack is:
+
+`HTTP plaintext` -> `TLS records (encrypted)` -> `TCP segments` -> `IP packets` -> `Link frames`
+
+Detailed sequence for HTTPS over TCP:
+
+1. Application (browser) asks OS to create a socket (`socket`).
+2. Application asks OS to connect TCP to remote IP:443 (`connect`).
+3. OS TCP stack performs 3-way handshake (SYN, SYN-ACK, ACK).
+4. After TCP is established, browser TLS stack sends `ClientHello` bytes on that socket.
+5. Server replies with handshake messages including certificate chain.
+6. Browser validates certificate and completes key exchange.
+7. TLS session keys are installed in browser TLS state.
+8. Browser writes HTTP request plaintext to TLS library.
+9. TLS library encrypts and emits TLS records; OS sends ciphertext bytes via TCP/IP.
+10. On receive path, OS delivers ciphertext bytes from socket to browser process; TLS library decrypts and returns plaintext HTTP response to browser networking code.
+
+Who implements what:
+
+- OS kernel: sockets API, TCP state machine, packet transmit/receive, congestion control.
+- Browser/app TLS stack (or platform TLS library): handshake logic, certificate validation, key schedule, record encryption/decryption.
+- Application protocol layer: HTTP semantics (methods, headers, bodies).
+
+## HTTPS Packet Format (Conceptual)
+
+For HTTP/2 over TLS over TCP, packets are conceptually layered as:
+
+```text
+L2 Frame
+	L3: IP header
+		L4: TCP header
+			TLS record header + encrypted payload
+				(inside decrypted payload: HTTP/2 frames)
+```
+
+Important note: OS does not usually deliver decrypted HTTPS to apps. It delivers socket bytes (ciphertext after TLS starts). Decryption is typically done in user-space TLS library inside browser/app process. After decryption, app sees plaintext HTTP messages.
+
+## Connecting HTTPS Internals to DoH
+
+DoH is simply DNS messages carried as an HTTPS application payload.
+
+- Normal HTTPS website: HTTPS payload is HTTP content API/page traffic.
+- DoH HTTPS session: HTTPS payload is DNS wire-format query/response.
+
+So DoH reuses the same HTTPS/TLS/TCP machinery, but with DNS semantics in the payload.
 
 ## Detailed Resolution Flow with Browser DoH
 
