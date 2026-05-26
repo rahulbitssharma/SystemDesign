@@ -23,6 +23,45 @@ When people say "DNS resolver" in production architecture, they usually mean the
 8. Authoritative server replies (e.g. CNAME -> A/AAAA chain).
 9. Recursive resolver caches each RRset by TTL and returns final answer to client.
 
+### Sequence Diagram (Conceptual)
+
+```text
+Client/App
+	|
+	| query www.example.com
+	v
+OS Stub Resolver
+	|
+	| recursive query
+	v
+Recursive Resolver
+	| cache miss
+	+--> Root (.)          : where is .com?
+	+<-- referral to TLD
+	+--> .com TLD          : where is example.com?
+	+<-- referral to auth NS
+	+--> Authoritative NS  : A/AAAA for www.example.com?
+	+<-- answer + TTL
+	|
+	+--> cache RRset
+	v
+Client gets final answer
+```
+
+### Architecture View
+
+```text
+									 [ Authoritative DNS Provider ]
+																	|
+										 iterative DNS|
+																	v
+[ Client Apps ] --recursive--> [ Recursive Resolver ]
+			^                                |
+			|                                | iterative referrals
+			| local lookup order             v
+[ OS Stub + hosts ]              Root -> TLD -> Auth
+```
+
 ## Query Types: Recursive vs Iterative
 
 - **Recursive query**: Client asks resolver "give me final answer".
@@ -53,6 +92,22 @@ Who configures which recursive resolver is used?
 - Browser code initiates lookup, but resolver choice is typically owned by OS/network configuration.
 
 Important exception: if browser DNS-over-HTTPS is enabled, browser may send DNS directly to its configured DoH provider instead of OS-configured UDP/TCP resolver path.
+
+### Code Example: System Resolver Path
+
+```python
+import socket
+
+hostname = "www.github.com"
+
+# Uses the OS resolver path for address lookup.
+results = socket.getaddrinfo(hostname, 443, proto=socket.IPPROTO_TCP)
+ips = sorted({item[4][0] for item in results})
+
+print(f"Resolved {hostname} to:")
+for ip in ips:
+	print(f"- {ip}")
+```
 
 ## Is HTTPS Used for DNS?
 
@@ -85,6 +140,47 @@ Example choice in practice:
 
 - Browser wants DNS privacy and easy deployment through existing HTTPS infrastructure: uses DoH endpoint like `https://dns.example.net/dns-query`.
 - Enterprise resolver encrypts upstream DNS between resolvers with explicit DNS transport identity: often uses DoT on port 853.
+
+### What Is the "Registry" Here?
+
+In this context, "registry" usually means browser/provider mapping data, not a global ICANN-style registry for DoH.
+
+Common sources a browser may use:
+
+- User-configured DoH endpoint (explicit URI in browser settings).
+- Enterprise policy (managed browser settings that force or disable secure DNS).
+- Browser-maintained resolver compatibility map (for auto-upgrade behavior).
+- Standards-based discovery metadata (for example DDR-style designated resolver discovery where supported).
+
+So there is no single universal public registry every browser must query for DoH endpoints.
+
+### How Browser Decides a Recursive Resolver Can Be Upgraded to DoH
+
+Typical decision pipeline in automatic mode:
+
+1. Detect currently configured system resolver(s) from OS network settings.
+2. Check explicit user or enterprise DoH setting first.
+3. If not explicit, attempt compatibility mapping/discovery:
+	- Browser-known resolver-to-DoH template mapping, and/or
+	- Discovery mechanisms supported by that platform/browser deployment.
+4. Bootstrap/connect to candidate DoH endpoint over HTTPS.
+5. Validate TLS certificate and endpoint policy checks.
+6. Send probe or real DNS queries; if successful, mark DoH usable.
+7. On repeated failure in automatic mode, fall back to OS DNS path.
+
+The key point: browser usually does not guess randomly. It uses policy + known mapping/discovery + live connectivity checks.
+
+### How Browser Decides About DoT and OS Resolver Path
+
+Most mainstream browsers primarily implement DoH at browser layer, not direct DoT selection per hostname.
+
+Typical behavior:
+
+- If browser DoH is enabled and works, browser performs DNS via DoH itself.
+- If browser DoH is off, unsupported, blocked, or fails in auto mode, browser calls OS resolver APIs.
+- Then OS resolver configuration decides transport (classic DNS, DoT, or OS-level DoH), not browser code.
+
+So when you see "browser lets OS resolve", that usually means browser delegates to OS stub resolver, and OS/network policy chooses whether DoT is used.
 
 ## Packet Flow Example: DoH vs DoT
 
@@ -153,6 +249,107 @@ Path B: DoH disabled or unavailable
 
 Important nuance: exact low-level system calls differ across engines and platforms, but this decision split (browser DoH path vs OS resolver path) is the key architecture.
 
+### Pseudo-Code: Browser DNS Path Selection
+
+```javascript
+async function resolveForNavigation(hostname) {
+	const cached = browserDnsCache.get(hostname);
+	if (cached && !cached.isExpired()) return cached.addresses;
+
+	const dohMode = settings.secureDnsMode; // off | automatic | strict
+	const dohEndpoint = settings.dohEndpoint;
+
+	if (dohMode !== "off") {
+		const canUseDoh = await dohPolicyAllows(hostname, dohEndpoint);
+		if (canUseDoh) {
+			try {
+				const answer = await resolveViaDoh(hostname, dohEndpoint);
+				browserDnsCache.put(hostname, answer.addresses, answer.ttlSeconds);
+				return answer.addresses;
+			} catch (err) {
+				if (dohMode === "strict") throw new Error("DoH failed in strict mode");
+			}
+		}
+	}
+
+	// Fallback path: use OS resolver APIs.
+	const osAnswer = await osResolverGetAddrInfo(hostname);
+	browserDnsCache.put(hostname, osAnswer.addresses, osAnswer.ttlSeconds);
+	return osAnswer.addresses;
+}
+```
+
+### Pseudo-Code: How Browser Determines DoH Eligibility
+
+```javascript
+async function selectDnsTransport(hostname) {
+	const mode = settings.secureDnsMode; // off | automatic | strict
+	const systemResolvers = os.getConfiguredResolvers();
+
+	// 1) Highest priority: explicit config/policy.
+	if (policy.forcedDohEndpoint) {
+		return { kind: "doh", endpoint: policy.forcedDohEndpoint };
+	}
+	if (mode === "off") {
+		return { kind: "os" };
+	}
+
+	// 2) Compatibility map or discovery metadata.
+	const mapped = browserResolverMap.lookup(systemResolvers);
+	const discovered = await tryDesignatedResolverDiscovery(systemResolvers);
+	const candidate = mapped ?? discovered;
+
+	if (!candidate) {
+		if (mode === "strict") throw new Error("No DoH candidate in strict mode");
+		return { kind: "os" };
+	}
+
+	// 3) Runtime validation.
+	const healthy = await probeDohEndpoint(candidate.endpoint);
+	if (healthy) {
+		return { kind: "doh", endpoint: candidate.endpoint };
+	}
+
+	if (mode === "strict") throw new Error("DoH probe failed in strict mode");
+	return { kind: "os" };
+}
+```
+
+### Pseudo-Code: OS Delegation and Potential DoT Use
+
+```javascript
+async function resolveViaOs(hostname) {
+	// Browser delegates to OS resolver API.
+	const answer = await osResolverGetAddrInfo(hostname);
+
+	// OS/network profile may use classic DNS, DoT, or OS-level DoH.
+	return answer;
+}
+```
+
+### Pseudo-Code: DoH Query and TLS Validation Flow
+
+```javascript
+async function resolveViaDoh(hostname, endpoint) {
+	// TLS handshake happens during HTTPS connection setup.
+	const queryWire = buildDnsWireQuery({ name: hostname, type: "A" });
+
+	const resp = await fetch(endpoint, {
+		method: "POST",
+		headers: {
+			"content-type": "application/dns-message",
+			"accept": "application/dns-message"
+		},
+		body: queryWire
+	});
+
+	if (!resp.ok) throw new Error(`DoH failed: ${resp.status}`);
+
+	const answerWire = new Uint8Array(await resp.arrayBuffer());
+	return parseDnsWireResponse(answerWire);
+}
+```
+
 ## How HTTPS Works Over TCP (And What OS Does)
 
 At a high level, HTTPS is HTTP carried inside TLS, and TLS is carried over TCP (or over QUIC for HTTP/3). For HTTP/1.1 and HTTP/2, the usual stack is:
@@ -200,6 +397,78 @@ DoH is simply DNS messages carried as an HTTPS application payload.
 - DoH HTTPS session: HTTPS payload is DNS wire-format query/response.
 
 So DoH reuses the same HTTPS/TLS/TCP machinery, but with DNS semantics in the payload.
+
+### Pseudo-Code: HTTPS Over TCP Socket Lifecycle
+
+```python
+def https_request(hostname: str, ip: str, request_bytes: bytes) -> bytes:
+	# 1) Open TCP socket via OS networking stack.
+	sock = os_socket(AF_INET, SOCK_STREAM)
+	os_connect(sock, (ip, 443))
+
+	# 2) Wrap socket with TLS context in user-space (or platform TLS library).
+	tls = tls_context(server_name=hostname, verify_cert=True)
+	tls_conn = tls.wrap_socket(sock)
+
+	# 3) TLS handshake exchanges certificates and session keys.
+	tls_conn.handshake()
+
+	# 4) App writes plaintext HTTP; TLS emits encrypted records.
+	tls_conn.write(request_bytes)
+
+	# 5) OS returns encrypted socket bytes; TLS decrypts before app reads.
+	response_plaintext = tls_conn.read_all()
+	return response_plaintext
+```
+
+### Pseudo-Code: Browser Navigation with DoH + HTTPS
+
+```python
+def navigate(url: str):
+	host = parse_host(url)
+
+	# DNS phase
+	if browser_settings.secure_dns_mode in ("automatic", "strict"):
+		dns_answer = resolve_via_doh(host)
+	else:
+		dns_answer = os_getaddrinfo(host)
+
+	target_ip = happy_eyeballs_select(dns_answer.addresses)
+
+	# Content phase: separate HTTPS session to website origin.
+	req = build_http_get(url)
+	page = https_request(host, target_ip, req)
+	return page
+```
+
+### Packet Flow: HTTPS and DoH Side-by-Side
+
+```text
+HTTPS to website (content):
+Browser app data: HTTP request
+	-> TLS record encrypt
+		-> TCP segment
+			-> IP packet
+				-> network
+
+DoH to resolver (DNS):
+Browser app data: DNS wire query in HTTP body
+	-> TLS record encrypt
+		-> TCP segment (or QUIC datagram for HTTP/3)
+			-> IP packet
+				-> network
+```
+
+### What OS Delivers to Browser Process
+
+```text
+Before TLS starts:
+- OS socket recv returns plaintext TLS handshake bytes from peer.
+
+After TLS starts (typical user-space TLS):
+- OS socket recv returns encrypted TLS records.
+- TLS library in browser decrypts and returns plaintext HTTP bytes to app code.
+```
 
 ## Detailed Resolution Flow with Browser DoH
 
@@ -267,6 +536,32 @@ Transport framing differences:
 - UDP: exactly one DNS message per datagram.
 - TCP: each DNS message is prefixed with a 2-byte length field on the stream.
 - DoH: DNS message is payload inside HTTP over TLS, so HTTP and TLS frames carry it on the wire.
+
+## Useful Commands for This Chapter
+
+```bash
+# Local resolver configuration (macOS)
+scutil --dns
+
+# Follow full delegation path
+dig +trace example.com A
+
+# Show only final answers
+dig www.github.com A +noall +answer
+
+# Reverse lookup
+dig -x 8.8.8.8 +noall +answer
+
+# Force TCP instead of UDP
+dig example.com A +tcp
+
+# Show if UDP response was truncated (look for "tc" flag)
+dig dnssec-failed.org DNSKEY +dnssec
+
+# Query a DoH endpoint over HTTPS
+curl -sS -H 'accept: application/dns-json' \
+	'https://dns.google/resolve?name=example.com&type=A'
+```
 
 ## Why Recursive Resolvers Are Critical
 

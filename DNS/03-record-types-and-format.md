@@ -102,6 +102,24 @@ api     IN A    203.0.113.20
 @       IN TXT  "v=spf1 include:_spf.example.net -all"
 ```
 
+## Code Example: Query Record Types
+
+```python
+# pip install dnspython
+import dns.resolver
+
+resolver = dns.resolver.Resolver()
+
+for rdata in resolver.resolve("example.com", "A"):
+    print("A:", rdata.to_text())
+
+for rdata in resolver.resolve("google.com", "NS"):
+    print("NS:", rdata.to_text())
+
+for rdata in resolver.resolve("example.com", "MX"):
+    print("MX:", rdata.to_text())
+```
+
 ## How Records Look in `dig` Output
 
 ```text

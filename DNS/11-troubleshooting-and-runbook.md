@@ -114,5 +114,5 @@ Prevention: Add pre-change DNSSEC validation checks in rollout pipeline
 ---
 
 **Navigation:**
-- [<- Previous: Code Examples and Diagrams](10-code-examples-and-diagrams.md)
+- [<- Previous: Consistency Guarantees](09-consistency.md)
 - [Back to Index](README.md)

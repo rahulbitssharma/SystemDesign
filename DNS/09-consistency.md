@@ -48,4 +48,4 @@ It does not guarantee globally linearizable name-to-address reads.
 **Navigation:**
 - [<- Previous: How DNS Scales](08-scaling.md)
 - [Back to Index](README.md)
-- [Next: Code Examples and Diagrams ->](10-code-examples-and-diagrams.md)
+- [Next: Troubleshooting and Runbook ->](11-troubleshooting-and-runbook.md)

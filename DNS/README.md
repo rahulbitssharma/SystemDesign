@@ -13,8 +13,7 @@ A practical, system-design focused guide to how DNS works in production: query f
 7. **[How Name Servers Are Organized](07-nameserver-organization.md)** — Root server letters, TLDs, authoritative providers, glue records.
 8. **[How DNS Scales](08-scaling.md)** — Anycast, distributed authoritative fleets, QPS handling, resolver cache economics.
 9. **[Consistency Guarantees and Propagation](09-consistency.md)** — Eventual consistency, TTL windows, SOA serials, operational patterns.
-10. **[Code Examples and Diagrams](10-code-examples-and-diagrams.md)** — Python examples and sequence/architecture diagrams.
-11. **[Troubleshooting and Runbook](11-troubleshooting-and-runbook.md)** — NXDOMAIN/SERVFAIL/timeout diagnostics, DNSSEC checks, and incident response steps.
+10. **[Troubleshooting and Runbook](11-troubleshooting-and-runbook.md)** — NXDOMAIN/SERVFAIL/timeout diagnostics, DNSSEC checks, and incident response steps.
 
 ---
 
@@ -22,6 +21,6 @@ A practical, system-design focused guide to how DNS works in production: query f
 
 **New to DNS?** Start with [Introduction](01-introduction.md) and [Resolution Flow and Resolver Role](02-resolution-flow-and-resolver.md).
 
-**Need practical debugging?** Go to [Live Resolution Walkthrough](05-live-resolution-example.md), [Code Examples and Diagrams](10-code-examples-and-diagrams.md), and [Troubleshooting and Runbook](11-troubleshooting-and-runbook.md).
+**Need practical debugging?** Go to [Live Resolution Walkthrough](05-live-resolution-example.md), [Resolution Flow and Resolver Role](02-resolution-flow-and-resolver.md), and [Troubleshooting and Runbook](11-troubleshooting-and-runbook.md).
 
 **Designing for reliability?** Read [How DNS Scales](08-scaling.md) and [Consistency Guarantees](09-consistency.md).
