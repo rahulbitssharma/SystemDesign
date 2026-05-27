@@ -284,6 +284,8 @@ async function resolveForNavigation(hostname) {
 ```javascript
 async function selectDnsTransport(hostname) {
 	const mode = settings.secureDnsMode; // off | automatic | strict
+	// Reads resolver IPs currently configured by OS/network stack
+	// (typically DHCP, manual OS DNS settings, VPN, or enterprise policy).
 	const systemResolvers = os.getConfiguredResolvers();
 
 	// 1) Highest priority: explicit config/policy.
@@ -314,6 +316,102 @@ async function selectDnsTransport(hostname) {
 	return { kind: "os" };
 }
 ```
+
+### Bootstrap Behavior on First DoH Attempt
+
+On first run, this is usually not a chicken-and-egg problem:
+
+- Browsers often ship with a built-in resolver compatibility map for common providers.
+- If mapping is unavailable, browser can attempt resolver discovery using current OS resolver path.
+- Initial bootstrap queries may use OS DNS before switching to DoH.
+- In `automatic` mode, no candidate or failed probe falls back to OS DNS.
+- In `strict` mode, no candidate or failed probe causes resolution failure instead of fallback.
+
+### Example Shape of `browserResolverMap`
+
+This is a simplified conceptual example (not real browser production data):
+
+```javascript
+const browserResolverMap = {
+	entries: [
+		{
+			match: {
+				provider: "Example ISP DNS",
+				resolverIps: ["203.0.113.53", "203.0.113.54"]
+			},
+			doh: {
+				endpoint: "https://doh.example-isp.net/dns-query",
+				template: "https://doh.example-isp.net/dns-query{?dns}"
+			}
+		},
+		{
+			match: {
+				provider: "Public Resolver A",
+				resolverIps: ["198.51.100.1", "198.51.100.2"]
+			},
+			doh: {
+				endpoint: "https://resolver-a.example/dns-query",
+				template: "https://resolver-a.example/dns-query{?dns}"
+			}
+		}
+	],
+
+	lookup(systemResolvers) {
+		for (const entry of this.entries) {
+			const hit = systemResolvers.some(r => entry.match.resolverIps.includes(r.ip));
+			if (hit) return entry.doh;
+		}
+		return null;
+	}
+};
+```
+
+Matching keys can vary by browser implementation, for example resolver IP sets, provider fingerprints, network metadata, policy constraints, or region-specific rollout rules.
+
+### Resolver IP vs DoH Endpoint: Why They Can Differ
+
+These two fields serve different roles:
+
+- `resolverIp` (from OS config) identifies the current classic DNS resolver service (usually UDP/TCP 53 path).
+- DoH `endpoint` identifies the HTTPS service used for encrypted DNS transport.
+
+They can be different because:
+
+- Providers often run classic DNS and DoH on different edge tiers.
+- DoH relies on hostname identity (TLS certificate + SNI), not just a raw IP.
+- Endpoint hostnames commonly resolve to load balancer/Anycast edges that can change by region/time.
+
+What `resolverIp` is used for in browser auto-upgrade:
+
+- Signal/fingerprint to identify likely provider compatibility.
+- Input to curated mapping or discovery logic.
+- Fallback target when automatic DoH is unavailable.
+
+### DDR-Style Designated Resolver Discovery (Via Resolver Path)
+
+DDR means the client asks the currently configured resolver for its designated encrypted resolver information.
+
+Typical flow:
+
+1. Browser gets system resolver list from OS.
+2. Browser sends discovery DNS queries over current resolver path.
+3. Resolver returns designated encrypted resolver metadata (for example DoH/DoT service binding hints).
+4. Browser builds candidate endpoint (for example `https://doh.provider.example/dns-query`).
+5. Browser validates candidate with TLS hostname/certificate checks and runtime probing.
+6. If valid, browser upgrades to DoH; if not, `automatic` falls back to OS DNS while `strict` fails closed.
+
+### Example: DHCP Resolver to DoH Mapping Lifecycle
+
+Example lifecycle on a new network:
+
+1. DHCP provides resolver IPs `203.0.113.53` and `203.0.113.54`.
+2. OS installs them as system resolvers.
+3. Browser reads these and checks `browserResolverMap`.
+4. Browser finds mapping to `https://doh.example-isp.net/dns-query` (or discovers it via DDR).
+5. Browser resolves `doh.example-isp.net` and opens TCP/TLS to returned edge IP (often load balancer/Anycast).
+6. Browser sends DoH HTTP request to `/dns-query` and receives DNS response.
+
+Important: the TCP destination for DoH is the endpoint host's current resolved IP, which may be a load balancer edge and not the same literal IP as OS resolver configuration.
 
 ### Pseudo-Code: OS Delegation and Potential DoT Use
 
