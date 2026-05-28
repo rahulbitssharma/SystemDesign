@@ -587,6 +587,134 @@ Two separate TLS contexts exist:
 - TLS session A: browser <-> DoH server (for DNS transport privacy)
 - TLS session B: browser <-> website origin (for application content security)
 
+## Reverse Proxy Demultiplexing and Response Correlation
+
+Many HTTPS services (including DoH) can share the same public IP:443. The reverse proxy separates traffic in layers and then routes responses back on the correct client socket.
+
+Demultiplexing path:
+
+1. TCP accept on shared listener (for example `198.51.100.20:443`).
+2. TLS handshake reads SNI to choose virtual certificate/site context.
+3. ALPN selects HTTP protocol (`h2`, `http/1.1`, or HTTP/3 stack).
+4. HTTP routing uses host/authority + path (for example `/dns-query`) to choose backend service.
+
+How proxy knows where to send backend response:
+
+1. Client request is parsed on downstream connection/stream.
+2. Proxy creates request context with IDs such as:
+	 - downstream connection ID
+	 - downstream stream ID (HTTP/2 or HTTP/3)
+	 - selected upstream connection/stream
+3. Proxy forwards request upstream and stores correlation map.
+4. Backend response arrives on upstream connection/stream.
+5. Proxy looks up correlation map and writes response to original downstream connection/stream.
+6. Context is cleaned up after response completion; sockets may remain open for reuse.
+
+Important nuance:
+
+- Response returns on the same browser<->proxy TCP socket (or QUIC connection) used by the request.
+- Proxy<->backend usually uses a different internal connection.
+
+### Sequence Diagram: Downstream and Upstream Correlation
+
+```mermaid
+sequenceDiagram
+	autonumber
+	participant C as Browser Client
+	participant P as Reverse Proxy
+	participant B as DoH Backend
+
+	C->>P: TCP/TLS connect to edge IP:443 (downstream conn D42)
+	C->>P: HTTP request stream S17 (POST /dns-query)
+	Note over P: Create request context R9001\nR9001 -> D42/S17
+	P->>B: Forward request on upstream conn U777 (stream U55)
+	Note over P: Store correlation\nR9001 -> U777/U55
+	B-->>P: HTTP response on U777/U55
+	P->>P: Lookup R9001 from U777/U55
+	P-->>C: Write response on original D42/S17
+	Note over P: Complete R9001\nKeep D42/U777 open for reuse
+```
+
+### Sequence Diagram: HTTP/1.1 Variant (No Stream IDs)
+
+```mermaid
+sequenceDiagram
+	autonumber
+	participant C as Browser Client
+	participant P as Reverse Proxy
+	participant B as Backend Service
+
+	C->>P: TCP/TLS connect (downstream conn D42)
+	C->>P: HTTP/1.1 request #1 on D42
+	Note over P: Create context R9001 -> D42
+	P->>B: Forward on upstream conn U777
+	B-->>P: Response for request #1 on U777
+	P-->>C: Write response on D42
+	Note over P: In HTTP/1.1, ordering on connection identifies response pairing
+```
+
+## DoH Message and Packet Shape (Detailed)
+
+DoH carries DNS wire-format messages inside HTTPS.
+
+On-wire layering (HTTP/1.1 or HTTP/2 over TLS over TCP):
+
+```text
+L2 frame
+	IP header
+		TCP header (dst port 443)
+			TLS record (encrypted)
+				HTTP headers + body
+					DNS wire message bytes
+```
+
+### Typical DoH Request Fields
+
+HTTP request (conceptual):
+
+```text
+POST /dns-query HTTP/2
+:authority: doh.example.net
+content-type: application/dns-message
+accept: application/dns-message
+[body = DNS wire query bytes]
+```
+
+Field meanings:
+
+- Host or `:authority`: identifies virtual HTTPS service at shared IP:443.
+- Path (`/dns-query`): routes to DoH handler.
+- `content-type: application/dns-message`: payload is raw DNS wire format.
+- `accept: application/dns-message`: client expects raw DNS wire response.
+
+### DNS Wire Payload Inside DoH Body
+
+Request payload typically includes:
+
+- Header (12 bytes): `ID`, flags (`RD` etc.), counts (`QDCOUNT`, ...)
+- Question: `QNAME`, `QTYPE` (A/AAAA/etc.), `QCLASS` (IN)
+
+Response payload typically includes:
+
+- Header with `QR=1`, `RCODE`, counts (`ANCOUNT`, ...)
+- Question echo
+- Answer records with `TTL` and `RDATA`
+- Optional authority/additional records
+
+### Typical DoH Response Fields
+
+```text
+HTTP/2 200
+content-type: application/dns-message
+[body = DNS wire response bytes]
+```
+
+Notes:
+
+- The DoH endpoint host is service identity for TLS/SNI and HTTP routing.
+- The endpoint host can resolve to load balancer or Anycast edge IPs.
+- Multiple applications can coexist on same IP:443 because demultiplexing occurs at TLS and HTTP layers.
+
 ## UDP vs TCP in DNS
 
 UDP characteristics:
