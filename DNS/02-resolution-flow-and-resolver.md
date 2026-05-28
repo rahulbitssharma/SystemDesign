@@ -11,7 +11,7 @@ There are two common resolver roles:
 
 When people say "DNS resolver" in production architecture, they usually mean the **recursive resolver**.
 
-## End-to-End Resolution (Typical)
+## End-to-End Resolution Flow
 
 1. App asks OS for `www.example.com`.
 2. OS checks local sources (browser cache, OS cache, `/etc/hosts`).
@@ -23,7 +23,7 @@ When people say "DNS resolver" in production architecture, they usually mean the
 8. Authoritative server replies (e.g. CNAME -> A/AAAA chain).
 9. Recursive resolver caches each RRset by TTL and returns final answer to client.
 
-### Sequence Diagram (Conceptual)
+### Sequence Diagram
 
 ```text
 Client/App
@@ -109,23 +109,13 @@ for ip in ips:
 	print(f"- {ip}")
 ```
 
-## Is HTTPS Used for DNS?
+## DNS Transport Options and Ownership
 
-Traditional DNS does not use HTTPS. Classic DNS typically uses:
+Traditional DNS and encrypted DNS modes are often discussed together; this section keeps them in one place.
 
-- UDP/53 for most queries
-- TCP/53 for specific cases (large responses, truncation fallback, zone transfer, reliability needs)
-
-Modern encrypted DNS options:
-
-- DNS-over-HTTPS (DoH): DNS messages carried inside HTTPS (HTTP/2 or HTTP/3) on port 443.
-- DNS-over-TLS (DoT): DNS messages inside TLS on port 853.
-
-So HTTPS can be used for DNS, but only when DoH is explicitly used by browser, OS, or resolver policy.
-
-## DoH vs DoT: Key Differences
-
-Both encrypt DNS, but they differ in encapsulation and operational behavior.
+- Classic DNS: UDP/53 by default, TCP/53 when needed.
+- DoT: DNS inside TLS on TCP/853.
+- DoH: DNS inside HTTPS on 443 (HTTP/2 or HTTP/3).
 
 | Dimension | DoH | DoT |
 |---|---|---|
@@ -136,118 +126,25 @@ Both encrypt DNS, but they differ in encapsulation and operational behavior.
 | Browser adoption | Very common in modern browsers | Less common directly in browsers |
 | Common use | Browser secure DNS, privacy over web path | OS/resolver-to-resolver encrypted DNS |
 
-Example choice in practice:
+Resolver ownership model:
 
-- Browser wants DNS privacy and easy deployment through existing HTTPS infrastructure: uses DoH endpoint like `https://dns.example.net/dns-query`.
-- Enterprise resolver encrypts upstream DNS between resolvers with explicit DNS transport identity: often uses DoT on port 853.
+- Browser usually asks OS resolver APIs by default.
+- OS/network policy chooses configured resolvers (DHCP/manual/VPN/enterprise policy).
+- If browser DoH is enabled, browser may bypass classic OS DNS transport and use a DoH endpoint directly.
 
-### What Is the "Registry" Here?
+There is no single global "DoH registry". Browsers combine user settings, enterprise policy, vendor-maintained compatibility maps, and optional discovery metadata (such as DDR).
 
-In this context, "registry" usually means browser/provider mapping data, not a global ICANN-style registry for DoH.
+## Browser DNS Decision Flow
 
-Common sources a browser may use:
+In practice, browser DNS selection is policy-first and fallback-safe:
 
-- User-configured DoH endpoint (explicit URI in browser settings).
-- Enterprise policy (managed browser settings that force or disable secure DNS).
-- Browser-maintained resolver compatibility map (for auto-upgrade behavior).
-- Standards-based discovery metadata (for example DDR-style designated resolver discovery where supported).
+1. Check explicit policy/user DoH settings.
+2. If in automatic mode, map current system resolver(s) to a DoH candidate and/or discover one.
+3. Probe and validate candidate endpoint over TLS.
+4. Use DoH when healthy; otherwise fall back to OS DNS in automatic mode.
+5. In strict mode, fail closed instead of falling back.
 
-So there is no single universal public registry every browser must query for DoH endpoints.
-
-### How Browser Decides a Recursive Resolver Can Be Upgraded to DoH
-
-Typical decision pipeline in automatic mode:
-
-1. Detect currently configured system resolver(s) from OS network settings.
-2. Check explicit user or enterprise DoH setting first.
-3. If not explicit, attempt compatibility mapping/discovery:
-	- Browser-known resolver-to-DoH template mapping, and/or
-	- Discovery mechanisms supported by that platform/browser deployment.
-4. Bootstrap/connect to candidate DoH endpoint over HTTPS.
-5. Validate TLS certificate and endpoint policy checks.
-6. Send probe or real DNS queries; if successful, mark DoH usable.
-7. On repeated failure in automatic mode, fall back to OS DNS path.
-
-The key point: browser usually does not guess randomly. It uses policy + known mapping/discovery + live connectivity checks.
-
-### How Browser Decides About DoT and OS Resolver Path
-
-Most mainstream browsers primarily implement DoH at browser layer, not direct DoT selection per hostname.
-
-Typical behavior:
-
-- If browser DoH is enabled and works, browser performs DNS via DoH itself.
-- If browser DoH is off, unsupported, blocked, or fails in auto mode, browser calls OS resolver APIs.
-- Then OS resolver configuration decides transport (classic DNS, DoT, or OS-level DoH), not browser code.
-
-So when you see "browser lets OS resolve", that usually means browser delegates to OS stub resolver, and OS/network policy chooses whether DoT is used.
-
-## Packet Flow Example: DoH vs DoT
-
-DoH flow (simplified):
-
-1. Client -> DoH server: TCP or QUIC connect (usually 443)
-2. TLS handshake + certificate validation
-3. HTTP request carrying DNS query bytes
-4. HTTP response carrying DNS answer bytes
-
-DoT flow (simplified):
-
-1. Client -> DoT server: TCP connect on 853
-2. TLS handshake + certificate validation
-3. DNS query bytes over TLS stream (no HTTP layer)
-4. DNS response bytes over TLS stream
-
-## Is DoH Default in Modern Browsers?
-
-Short answer: often "automatic by default" in modern browsers, but not always "strictly on" for every network.
-
-Typical current behavior:
-
-- Browser enables secure-DNS auto-upgrade mode for many users.
-- Browser first checks if known DoH can be used for the current resolver/provider.
-- If compatible, browser upgrades DNS transport to DoH.
-- If not compatible and strict mode is not enabled, browser falls back to system DNS.
-
-So, in modern browsers DoH support is common and frequently enabled in auto mode, while mandatory DoH-only behavior is less common.
-
-At OS level, encrypted DNS support is growing, but default behavior varies by platform and enterprise policy.
-
-## How Certificates Are Exchanged (DoH/DoT)
-
-Certificate exchange happens in the TLS handshake between DNS client and encrypted DNS endpoint.
-
-High-level flow:
-
-1. Client opens TLS connection to DoH/DoT server.
-2. Server sends certificate chain (leaf + intermediates).
-3. Client validates hostname, chain trust, validity period, and revocation/policy checks.
-4. If valid, secure session keys are established.
-5. DNS queries/responses flow inside that encrypted channel.
-
-For DoH specifically, after TLS succeeds the client sends DNS payload as HTTP requests (often `application/dns-message` or JSON API variants).
-
-## What Browser System Calls Look Like When DoH Is Enabled
-
-Conceptually, browser networking code chooses one of two resolution paths.
-
-Path A: DoH enabled and usable
-
-1. Browser checks host resolver/cache and its own DNS cache.
-2. Browser opens HTTPS connection to DoH endpoint.
-3. Browser validates DoH server certificate in TLS handshake.
-4. Browser sends DNS query in HTTP request body/URL.
-5. Browser parses DNS response and caches per TTL.
-6. Browser opens TCP/TLS (or QUIC/TLS) connection to destination origin using resolved IP.
-
-Path B: DoH disabled or unavailable
-
-1. Browser calls OS resolver API (for example, `getaddrinfo`-style API).
-2. OS stub sends DNS query to configured recursive resolver over UDP/TCP 53 (or OS-configured encrypted transport).
-3. OS returns results to browser.
-4. Browser connects to destination origin.
-
-Important nuance: exact low-level system calls differ across engines and platforms, but this decision split (browser DoH path vs OS resolver path) is the key architecture.
+Most browsers implement DoH at browser layer. DoT selection is typically an OS/network concern when browser delegates to OS resolver APIs.
 
 ### Pseudo-Code: Browser DNS Path Selection
 
@@ -327,7 +224,9 @@ On first run, this is usually not a chicken-and-egg problem:
 - In `automatic` mode, no candidate or failed probe falls back to OS DNS.
 - In `strict` mode, no candidate or failed probe causes resolution failure instead of fallback.
 
-### Example Shape of `browserResolverMap`
+## Resolver Mapping, Discovery, and Endpoint Semantics
+
+### Example: browserResolverMap Shape
 
 This is a simplified conceptual example (not real browser production data):
 
@@ -413,6 +312,32 @@ Example lifecycle on a new network:
 
 Important: the TCP destination for DoH is the endpoint host's current resolved IP, which may be a load balancer edge and not the same literal IP as OS resolver configuration.
 
+## DoH vs DoT Packet and TLS Flow
+
+DoH flow (simplified):
+
+1. Client -> DoH server: TCP/QUIC connect (usually 443).
+2. TLS handshake + certificate validation.
+3. HTTP request carrying DNS query bytes.
+4. HTTP response carrying DNS answer bytes.
+
+DoT flow (simplified):
+
+1. Client -> DoT server: TCP connect on 853.
+2. TLS handshake + certificate validation.
+3. DNS query bytes over TLS stream (no HTTP layer).
+4. DNS response bytes over TLS stream.
+
+Certificate validation behavior is the same at a high level for both DoH and DoT: endpoint identity, certificate chain trust, validity period, and policy checks must pass before DNS data is exchanged.
+
+## Modern Browser Default Behavior
+
+Short answer: DoH is often enabled in automatic mode, not always strict mode.
+
+- Compatible networks/providers: browser may auto-upgrade to DoH.
+- Incompatible/unhealthy candidate: automatic mode falls back to system DNS.
+- Strict mode: no fallback when DoH is required.
+
 ### Pseudo-Code: OS Delegation and Potential DoT Use
 
 ```javascript
@@ -448,7 +373,7 @@ async function resolveViaDoh(hostname, endpoint) {
 }
 ```
 
-## How HTTPS Works Over TCP (And What OS Does)
+## HTTPS Over TCP: Runtime Responsibilities
 
 At a high level, HTTPS is HTTP carried inside TLS, and TLS is carried over TCP (or over QUIC for HTTP/3). For HTTP/1.1 and HTTP/2, the usual stack is:
 
@@ -473,7 +398,7 @@ Who implements what:
 - Browser/app TLS stack (or platform TLS library): handshake logic, certificate validation, key schedule, record encryption/decryption.
 - Application protocol layer: HTTP semantics (methods, headers, bodies).
 
-## HTTPS Packet Format (Conceptual)
+## HTTPS Packet Format
 
 For HTTP/2 over TLS over TCP, packets are conceptually layered as:
 
@@ -617,7 +542,7 @@ Important HTTP/2 response attributes:
 - Optional body in `DATA` frames
 - End of stream flag to mark completion
 
-### DNS-Focused HTTPS Examples (DoH)
+### Examples: DNS-Focused HTTPS (DoH)
 
 The examples below show HTTPS fields specifically for DNS-over-HTTPS traffic.
 
@@ -734,7 +659,7 @@ Notes:
 - TCP provides ordered byte stream delivery; TLS and HTTP parse those bytes into higher-layer records/messages.
 - With HTTP/2, multiple streams can be interleaved on the same TCP connection.
 
-### TLS 1.3 Handshake Transcript (Message by Message)
+### TLS 1.3 Handshake Transcript
 
 This table summarizes the common full handshake path (without client certificate authentication).
 
@@ -756,14 +681,19 @@ Important details:
 - Perfect forward secrecy is provided by ephemeral key exchange (`key_share` / ECDHE).
 - Session resumption can use PSK tickets to reduce latency on later connections.
 
-## Connecting HTTPS Internals to DoH
+## Mapping HTTPS Internals to DoH
 
-DoH is simply DNS messages carried as an HTTPS application payload.
+DoH reuses the same HTTPS/TLS/TCP machinery and changes only the application payload semantics.
 
-- Normal HTTPS website: HTTPS payload is HTTP content API/page traffic.
-- DoH HTTPS session: HTTPS payload is DNS wire-format query/response.
+- Regular HTTPS: HTTP payload carries web/app content.
+- DoH HTTPS: HTTP payload carries DNS wire-format query/response bytes.
 
-So DoH reuses the same HTTPS/TLS/TCP machinery, but with DNS semantics in the payload.
+Use the following blocks in this order:
+
+1. Pseudocode for browser/runtime behavior.
+2. End-to-end resolution flow.
+3. Reverse-proxy demultiplexing and response correlation.
+4. DoH wire/message field layout.
 
 ### Pseudo-Code: HTTPS Over TCP Socket Lifecycle
 
@@ -837,28 +767,28 @@ After TLS starts (typical user-space TLS):
 - TLS library in browser decrypts and returns plaintext HTTP bytes to app code.
 ```
 
-## Detailed Resolution Flow with Browser DoH
+## Browser DoH Resolution Flow
 
-When browser-side DoH is active, lookup and page load usually look like this:
+When browser-side DoH is active, lookup and page load usually follow this sequence:
 
 1. User enters `https://www.example.com`.
 2. Browser checks local caches (host cache, DNS cache, preconnect/prefetch state).
 3. Browser sends DoH query for A/AAAA to configured DoH endpoint.
 4. DoH endpoint's recursive resolver performs iterative lookup if cache miss.
 5. DoH response returns answer and TTL to browser.
-6. Browser chooses endpoint candidate(s) (IPv6/IPv4 policy such as Happy Eyeballs).
+6. Browser chooses target IP candidate(s) (IPv6/IPv4 policy such as Happy Eyeballs).
 7. Browser connects to target IP and starts HTTPS handshake with target website.
 8. Website certificate exchange happens separately from DoH certificate exchange.
 9. HTTP request/response for page content proceeds after website TLS is established.
 
-Two separate TLS contexts exist:
+Two separate TLS contexts exist and should be reasoned about independently:
 
 - TLS session A: browser <-> DoH server (for DNS transport privacy)
 - TLS session B: browser <-> website origin (for application content security)
 
 ## Reverse Proxy Demultiplexing and Response Correlation
 
-Many HTTPS services (including DoH) can share the same public IP:443. The reverse proxy separates traffic in layers and then routes responses back on the correct client socket.
+Many HTTPS services (including DoH) can share one public IP:443. Reverse proxy logic first demultiplexes requests, then correlates upstream replies back to the correct downstream connection/stream.
 
 Demultiplexing path:
 
@@ -867,7 +797,7 @@ Demultiplexing path:
 3. ALPN selects HTTP protocol (`h2`, `http/1.1`, or HTTP/3 stack).
 4. HTTP routing uses host/authority + path (for example `/dns-query`) to choose backend service.
 
-How proxy knows where to send backend response:
+How proxy maps backend response to correct client socket:
 
 1. Client request is parsed on downstream connection/stream.
 2. Proxy creates request context with IDs such as:
@@ -922,9 +852,9 @@ sequenceDiagram
 	Note over P: In HTTP/1.1, ordering on connection identifies response pairing
 ```
 
-## DoH Message and Packet Shape (Detailed)
+## DoH Message and Packet Format
 
-DoH carries DNS wire-format messages inside HTTPS.
+This section is the wire-level reference for DoH payload structure.
 
 On-wire layering (HTTP/1.1 or HTTP/2 over TLS over TCP):
 
@@ -937,7 +867,7 @@ L2 frame
 					DNS wire message bytes
 ```
 
-### Typical DoH Request Fields
+### Fields: DoH Request
 
 HTTP request (conceptual):
 
@@ -956,7 +886,7 @@ Field meanings:
 - `content-type: application/dns-message`: payload is raw DNS wire format.
 - `accept: application/dns-message`: client expects raw DNS wire response.
 
-### DNS Wire Payload Inside DoH Body
+### Fields: DNS Wire Payload Inside DoH Body
 
 Request payload typically includes:
 
@@ -970,7 +900,7 @@ Response payload typically includes:
 - Answer records with `TTL` and `RDATA`
 - Optional authority/additional records
 
-### Typical DoH Response Fields
+### Fields: DoH Response
 
 ```text
 HTTP/2 200
