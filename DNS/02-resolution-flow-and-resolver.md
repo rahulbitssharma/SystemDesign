@@ -487,6 +487,275 @@ L2 Frame
 
 Important note: OS does not usually deliver decrypted HTTPS to apps. It delivers socket bytes (ciphertext after TLS starts). Decryption is typically done in user-space TLS library inside browser/app process. After decryption, app sees plaintext HTTP messages.
 
+### HTTPS Field Breakdown by Layer
+
+The following fields are the most relevant attributes engineers inspect during debugging and packet analysis.
+
+#### IP Header Fields (IPv4)
+
+- Version: `4`
+- IHL (header length)
+- DSCP/ECN
+- Total Length
+- Identification
+- Flags + Fragment Offset
+- TTL
+- Protocol (`6` for TCP)
+- Header Checksum
+- Source IP
+- Destination IP
+
+IPv6 has different base fields (`Traffic Class`, `Flow Label`, `Payload Length`, `Next Header`, `Hop Limit`, source/destination addresses) and extension headers.
+
+#### TCP Header Fields
+
+- Source Port
+- Destination Port (`443` for HTTPS over TCP)
+- Sequence Number
+- Acknowledgment Number
+- Data Offset
+- Flags (`SYN`, `ACK`, `PSH`, `FIN`, `RST`, etc.)
+- Window Size
+- Checksum
+- Urgent Pointer
+- Options (common: MSS, Window Scale, SACK Permitted, Timestamps)
+
+#### TLS Record Layer Fields
+
+Each TLS record has:
+
+- Content Type (Handshake, Application Data, Alert)
+- Legacy Version field
+- Record Length
+- Encrypted payload (after handshake keys are active)
+
+TLS 1.3 note: most post-handshake traffic appears as encrypted application data records on wire.
+
+#### TLS Handshake Attributes (ClientHello/ServerHello)
+
+Common ClientHello attributes:
+
+- Supported Versions (for example TLS 1.3)
+- Cipher Suites
+- Extensions:
+  - SNI (server name)
+  - ALPN (`h2`, `http/1.1`)
+  - Supported Groups (ECDHE groups)
+  - Signature Algorithms
+  - Key Share
+
+Common server-side handshake attributes:
+
+- Chosen TLS version
+- Chosen cipher suite
+- Certificate chain
+- Key share response
+- Finished message proving key agreement
+
+#### HTTP/1.1 Request Fields (Inside TLS)
+
+```text
+GET /products?id=42 HTTP/1.1
+Host: www.example.com
+User-Agent: ExampleBrowser/1.0
+Accept: text/html,application/xhtml+xml
+Accept-Encoding: gzip, br
+Connection: keep-alive
+Cookie: session=abc123
+
+```
+
+Key request attributes:
+
+- Method (`GET`, `POST`, etc.)
+- Target (`/path?query`)
+- Version (`HTTP/1.1`)
+- Host header (required in HTTP/1.1)
+- Request headers (content negotiation, auth, caching, cookies)
+- Optional body (for example JSON form payload)
+
+#### HTTP/1.1 Response Fields (Inside TLS)
+
+```text
+HTTP/1.1 200 OK
+Date: Thu, 28 May 2026 10:00:00 GMT
+Content-Type: text/html; charset=utf-8
+Content-Length: 1256
+Cache-Control: max-age=60
+Set-Cookie: session=def456; Secure; HttpOnly; SameSite=Lax
+
+<html>...</html>
+```
+
+Key response attributes:
+
+- Status line (version, status code, reason phrase)
+- Response headers (type, cache, cookies, security headers)
+- Optional body bytes
+
+#### HTTP/2 Frame Structure (Inside TLS)
+
+HTTP/2 transports messages as frames on streams.
+
+Frame header (9 bytes):
+
+- Length (24 bits)
+- Type (for example `HEADERS`, `DATA`, `SETTINGS`, `WINDOW_UPDATE`)
+- Flags
+- Stream Identifier (31 bits)
+
+Important HTTP/2 request attributes:
+
+- Pseudo-headers: `:method`, `:scheme`, `:authority`, `:path`
+- Regular headers (compressed with HPACK)
+- Stream ID identifying request/response pair
+
+Important HTTP/2 response attributes:
+
+- `:status` pseudo-header (for example `200`)
+- Response headers in `HEADERS` frame
+- Optional body in `DATA` frames
+- End of stream flag to mark completion
+
+### DNS-Focused HTTPS Examples (DoH)
+
+The examples below show HTTPS fields specifically for DNS-over-HTTPS traffic.
+
+#### DoH HTTP/2 POST Request Example
+
+```text
+:method: POST
+:scheme: https
+:authority: doh.example.net
+:path: /dns-query
+content-type: application/dns-message
+accept: application/dns-message
+content-length: 33
+```
+
+Meaning of important fields:
+
+- `:authority`: DoH virtual host identity used with TLS SNI/certificate.
+- `:path`: DoH application endpoint (`/dns-query`).
+- `content-type`: body contains binary DNS wire-format message.
+- `accept`: client expects DNS wire-format response body.
+
+#### DoH HTTP/2 GET Request Example
+
+```text
+:method: GET
+:scheme: https
+:authority: doh.example.net
+:path: /dns-query?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB
+accept: application/dns-message
+```
+
+Notes:
+
+- `dns=` query value is base64url-encoded DNS wire query.
+- GET is common for cache-friendly resolver deployments; POST is common for larger or simpler binary handling.
+
+#### DoH HTTP Response Example
+
+```text
+:status: 200
+content-type: application/dns-message
+cache-control: max-age=300
+content-length: 49
+```
+
+Meaning of important fields:
+
+- `:status=200` indicates HTTP transport success (DNS result still in body `RCODE`).
+- `content-type` confirms response body is DNS wire bytes.
+- `cache-control` is HTTP-layer cache metadata; DNS TTL in body still governs DNS semantics.
+
+#### DNS Wire Fields Inside DoH Body (Example Query/Answer)
+
+Query body (conceptual values):
+
+- `ID`: `0x4a3f`
+- `Flags`: `RD=1`
+- `QDCOUNT`: `1`
+- `Question`: `QNAME=www.example.com`, `QTYPE=A`, `QCLASS=IN`
+
+Response body (conceptual values):
+
+- `ID`: `0x4a3f` (matches query)
+- `Flags`: `QR=1`, `RA=1`, `RCODE=0`
+- `ANCOUNT`: `1`
+- `Answer`: `NAME=www.example.com`, `TYPE=A`, `TTL=300`, `RDATA=93.184.216.34`
+
+Interpretation rule:
+
+- HTTP status reports DoH transport success/failure.
+- DNS header (`RCODE`, answer counts, TTL, records) reports DNS lookup result.
+
+### Detailed HTTPS Exchange Sequence
+
+```mermaid
+sequenceDiagram
+	autonumber
+	participant C as Client Browser
+	participant S as HTTPS Server
+
+	C->>S: TCP SYN (src ephemeral port, dst 443)
+	S-->>C: TCP SYN-ACK
+	C->>S: TCP ACK
+	C->>S: TLS ClientHello (SNI, ALPN, key share)
+	S-->>C: TLS ServerHello + Certificate + Finished
+	C->>S: TLS Finished
+	Note over C,S: Handshake complete, symmetric keys active
+	C->>S: Encrypted HTTP request (HEADERS/DATA)
+	S-->>C: Encrypted HTTP response (HEADERS/DATA)
+	C->>S: TCP ACKs for received segments
+	S-->>C: Optional additional responses on same keep-alive connection
+```
+
+### Packet View of One HTTPS Request/Response
+
+```text
+Client -> Server
+IP(src=client,dst=server)
+TCP(src=53144,dst=443,seq=1001,ack=5001,flags=PSH,ACK)
+TLS(record=ApplicationData,len=...)
+HTTP(payload=request headers/body)
+
+Server -> Client
+IP(src=server,dst=client)
+TCP(src=443,dst=53144,seq=5001,ack=...,flags=PSH,ACK)
+TLS(record=ApplicationData,len=...)
+HTTP(payload=response headers/body)
+```
+
+Notes:
+
+- Packet boundaries and HTTP message boundaries are not the same. One HTTP message may span many TLS records and TCP segments.
+- TCP provides ordered byte stream delivery; TLS and HTTP parse those bytes into higher-layer records/messages.
+- With HTTP/2, multiple streams can be interleaved on the same TCP connection.
+
+### TLS 1.3 Handshake Transcript (Message by Message)
+
+This table summarizes the common full handshake path (without client certificate authentication).
+
+| Order | Sender | Handshake Message | Main Attributes | Security Contribution |
+|---|---|---|---|---|
+| 1 | Client | ClientHello | `supported_versions`, `cipher_suites`, `key_share`, `signature_algorithms`, `server_name` (SNI), `alpn` | Proposes capabilities and ephemeral key share; identifies intended hostname; starts key agreement. |
+| 2 | Server | ServerHello | selected version/cipher, server `key_share` | Selects final crypto parameters and completes ECDHE shared-secret derivation. |
+| 3 | Server | EncryptedExtensions | negotiated ALPN and extension outcomes | Moves extension negotiation under encryption; confirms protocol details. |
+| 4 | Server | Certificate | certificate chain for server identity | Provides identity material for authentication (PKI chain). |
+| 5 | Server | CertificateVerify | signature over handshake transcript | Proves possession of private key corresponding to certificate. |
+| 6 | Server | Finished | MAC over transcript with handshake traffic keys | Cryptographically commits server handshake state integrity. |
+| 7 | Client | Finished | MAC over transcript with handshake traffic keys | Confirms client handshake state and key agreement completion. |
+| 8 | Both | Application Data | encrypted HTTP bytes in TLS records | Secure channel active: confidentiality + integrity for request/response traffic. |
+
+Important details:
+
+- In TLS 1.3, most handshake messages after `ServerHello` are encrypted.
+- The certificate is transmitted in the handshake, but protected after handshake keys are available.
+- Perfect forward secrecy is provided by ephemeral key exchange (`key_share` / ECDHE).
+- Session resumption can use PSK tickets to reduce latency on later connections.
+
 ## Connecting HTTPS Internals to DoH
 
 DoH is simply DNS messages carried as an HTTPS application payload.
