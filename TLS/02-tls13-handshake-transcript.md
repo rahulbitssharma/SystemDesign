@@ -71,6 +71,44 @@ The critical inputs are:
 
 This means the symmetric traffic keys are not randomly chosen in isolation; they are deterministically derived from handshake inputs and shared secrets.
 
+### Clarification: "PSK or Zero Input" Means
+
+- If session resumption/external PSK is used, the key schedule starts from that PSK material.
+- If no PSK is used (normal full handshake), the schedule uses a zero-value placeholder at the earliest stage.
+- This does **not** mean final traffic keys are zero; ECDHE and transcript inputs are mixed in next and produce real traffic secrets.
+
+### Clarification: Is ECDHE the Shared Secret?
+
+- ECDHE is the key-agreement method, not the final shared secret value itself.
+- Client and server exchange ephemeral public keys.
+- Each side computes the same ECDHE shared secret locally from its own ephemeral private key and the peer's ephemeral public key.
+
+Conceptually:
+
+- client computes `ECDH(c_priv, s_pub)`
+- server computes `ECDH(s_priv, c_pub)`
+- both results match and feed the TLS key schedule
+
+### Clarification: What "Ephemeral Per Connection" Means
+
+- Each handshake uses fresh temporary ECDHE key pairs.
+- Those ECDHE private keys are not long-term identity keys.
+- A new connection generally means new ECDHE key material and a new shared secret.
+
+### Clarification: If Server Certificate Private Key Leaks, Can Old TLS 1.3 Traffic Be Decrypted?
+
+Usually no, if forward secrecy conditions hold.
+
+- Leaked certificate private key is a long-term identity key.
+- Past session traffic keys came from ephemeral ECDHE shared secrets.
+- Without the session-specific ephemeral ECDHE private keys (or exported session secrets), previously captured traffic remains protected.
+
+Cases where old captures may become decryptable:
+
+- session secrets/key logs were exposed
+- ephemeral private keys were compromised from process memory
+- non-forward-secret key exchange mode was used (not normal TLS 1.3 ECDHE path)
+
 Conceptual derivation chain:
 
 ```text
