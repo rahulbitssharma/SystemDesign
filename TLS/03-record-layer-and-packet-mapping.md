@@ -175,6 +175,25 @@ TCP/IP output:
 
 TLS 1.3 record protection uses AEAD (for example AES-GCM or ChaCha20-Poly1305).
 
+## How Symmetric Keys Are Used at Record Time
+
+Once the handshake is complete, each side has directional traffic-protection material such as:
+
+- write key
+- read key
+- write IV
+- read IV
+- write sequence number
+- read sequence number
+
+When the client sends one TLS record:
+
+1. client uses its write key and write IV
+2. server uses its corresponding read key and read IV
+3. both sides keep sequence numbers in sync for that direction
+
+This is what turns negotiated handshake state into actual packet protection on the wire.
+
 Core inputs per record:
 
 - Write key (direction-specific)
@@ -182,9 +201,115 @@ Core inputs per record:
 - Record sequence number (monotonic counter)
 - Additional authenticated data (record header fields)
 
+### Why Sequence Numbers Matter
+
+Sequence numbers ensure that:
+
+- each record gets a distinct nonce
+- records cannot be safely replayed or reordered without detection at higher integrity checks
+- sender and receiver evolve record state deterministically
+
+Sequence numbers are not usually transmitted explicitly inside TLS 1.3 records; they are maintained implicitly by both peers.
+
 Conceptual nonce derivation:
 
 `per_record_nonce = static_iv XOR padded(sequence_number)`
+
+### Worked Example: Encrypting One TLS Application Record
+
+Assume:
+
+- cipher suite: `TLS_AES_128_GCM_SHA256`
+- client write key = `K_client`
+- client write IV = `IV_client`
+- client sequence number = `5`
+- plaintext = `"GET / HTTP/1.1\r\nHost: www.example.com\r\n\r\n"`
+
+Conceptual flow:
+
+1. Build `TLSInnerPlaintext = plaintext || application_data`
+2. Compute `nonce = IV_client XOR pad64(5)`
+3. Build record header AAD
+4. Run `AES-128-GCM(K_client, nonce, inner_plaintext, aad)`
+5. Emit TLS record header + ciphertext + authentication tag
+
+On the receiving side:
+
+1. server reads next record
+2. server uses its read key corresponding to client's write direction
+3. server computes same nonce from read IV and sequence number `5`
+4. server decrypts and authenticates record
+5. if tag check fails, decryption fails and connection is aborted
+
+### Pseudo-Code: Encrypt One Record with Symmetric Traffic Keys
+
+```python
+def protect_record(plaintext, write_key, write_iv, seq_num, content_type):
+    inner = build_inner_plaintext(plaintext, content_type)
+    header = build_tls_record_header_placeholder()
+    nonce = xor_nonce(write_iv, seq_num)
+    ciphertext = aead_encrypt(write_key, nonce, inner, header)
+    return serialize_tls_record(ciphertext)
+```
+
+### Pseudo-Code: Decrypt One Record with Symmetric Traffic Keys
+
+```python
+def unprotect_record(record, read_key, read_iv, seq_num):
+    header = record[:5]
+    ciphertext = record[5:]
+    nonce = xor_nonce(read_iv, seq_num)
+    inner = aead_decrypt(read_key, nonce, ciphertext, header)
+    return parse_inner_plaintext(inner)
+```
+
+### C-Style Pseudo-Code: Conceptual Record Protection
+
+```c
+tls_nonce_t nonce = tls_build_nonce(client_write_iv, client_seq_num);
+tls_ciphertext_t ct = aead_encrypt(
+    client_write_key,
+    nonce,
+    inner_plaintext,
+    record_header_aad
+);
+client_seq_num++;
+```
+
+### C-Style Pseudo-Code: Conceptual Record Unprotection
+
+```c
+tls_nonce_t nonce = tls_build_nonce(server_read_iv, expected_seq_num);
+int ok = aead_decrypt(
+    server_read_key,
+    nonce,
+    ciphertext,
+    record_header_aad,
+    plaintext_out
+);
+if (!ok) {
+    /* bad_record_mac / decrypt_error style failure */
+}
+expected_seq_num++;
+```
+
+## Where the Symmetric Keys Come From in Code
+
+Applications typically do not manually choose TLS traffic keys. The TLS library derives them after handshake based on:
+
+- negotiated cipher suite
+- ECDHE shared secret or PSK
+- transcript hashes
+
+Then the TLS record layer internally stores them in session state.
+
+So the common application model is:
+
+1. configure policies and supported cipher suites
+2. run handshake
+3. TLS library derives traffic keys automatically
+4. application calls `SSL_write` / `SSL_read` or equivalent
+5. TLS library uses those symmetric keys internally for every record
 
 ## Send Path Deep Dive
 

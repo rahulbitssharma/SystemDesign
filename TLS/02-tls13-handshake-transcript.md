@@ -21,6 +21,36 @@ The easiest way to reason about TLS 1.3 is to separate four questions:
 
 TLS 1.3 uses HKDF to derive successive secrets from a small number of core inputs.
 
+## What Are Symmetric Keys?
+
+Symmetric keys are secret byte strings that both peers know and use for the same cryptographic operation family.
+
+In TLS, they are used for:
+
+- encrypting plaintext into ciphertext
+- decrypting ciphertext back into plaintext
+- authenticating records so tampering is detected
+- deriving per-record nonces and related traffic-protection state
+
+Why they are called symmetric:
+
+- unlike asymmetric cryptography, there is no public/private key pair for record protection
+- both sides end up with corresponding traffic secrets and derived keys for each direction
+
+Important nuance:
+
+- TLS does **not** use one single shared key for everything
+- it derives separate keys per direction and per phase
+
+Typical directional split:
+
+- client write key: used to encrypt records sent by client
+- server read key: used by server to decrypt those same records
+- server write key: used to encrypt records sent by server
+- client read key: used by client to decrypt those same records
+
+So the keys are symmetric for the communicating pair, but directional in usage.
+
 At a high level, the flow is:
 
 1. Start from an initial secret (or PSK if resuming).
@@ -29,6 +59,17 @@ At a high level, the flow is:
 4. Derive finished keys.
 5. Derive application traffic secrets.
 6. Optionally derive resumption secrets/tickets.
+
+### What Inputs Generate the Symmetric Keys?
+
+The critical inputs are:
+
+1. PSK or zero input for initial stage
+2. ECDHE shared secret from `key_share`
+3. Transcript hashes of handshake bytes
+4. Hash function selected by the negotiated cipher suite
+
+This means the symmetric traffic keys are not randomly chosen in isolation; they are deterministically derived from handshake inputs and shared secrets.
 
 Conceptual derivation chain:
 
@@ -42,6 +83,28 @@ early_secret
   -> client_application_traffic_secret_0
   -> server_application_traffic_secret_0
   -> exporter_secret / resumption_master_secret
+```
+
+### How This Leads to Actual Encryption Keys
+
+From traffic secrets, TLS derives concrete record-layer materials such as:
+
+- AEAD write key
+- AEAD read key
+- static write IV
+- static read IV
+- finished keys
+
+Conceptual expansion:
+
+```text
+client_application_traffic_secret_0
+    -> client_write_key
+    -> client_write_iv
+
+server_application_traffic_secret_0
+    -> server_write_key
+    -> server_write_iv
 ```
 
 ### Pseudo-Code: HKDF-Style Key Schedule
@@ -65,6 +128,28 @@ def derive_tls13_secrets(psk, ecdhe_secret, transcript_hashes):
     client_app = derive_secret(master_secret, "c ap traffic", transcript_hashes["finished"])
     server_app = derive_secret(master_secret, "s ap traffic", transcript_hashes["finished"])
     return client_hs, server_hs, client_app, server_app
+```
+
+### Pseudo-Code: Derive Concrete Traffic Keys from Traffic Secret
+
+```python
+def derive_record_protection_keys(traffic_secret, key_len, iv_len):
+    write_key = hkdf_expand_label(traffic_secret, "key", b"", key_len)
+    write_iv = hkdf_expand_label(traffic_secret, "iv", b"", iv_len)
+    return write_key, write_iv
+```
+
+### C-Style Pseudo-Code: Conceptual Traffic-Key Derivation
+
+```c
+tls_secret_t client_app_secret = tls13_derive_secret(master_secret, "c ap traffic", finished_hash);
+tls_secret_t server_app_secret = tls13_derive_secret(master_secret, "s ap traffic", finished_hash);
+
+tls_key_t client_write_key = hkdf_expand_label(client_app_secret, "key", NULL, key_len);
+tls_iv_t  client_write_iv  = hkdf_expand_label(client_app_secret, "iv", NULL, iv_len);
+
+tls_key_t server_write_key = hkdf_expand_label(server_app_secret, "key", NULL, key_len);
+tls_iv_t  server_write_iv  = hkdf_expand_label(server_app_secret, "iv", NULL, iv_len);
 ```
 
 ## Handshake Timeline (No Client Certificate)
@@ -204,6 +289,40 @@ Why cipher suites are useful:
 - They let both peers agree on one interoperable security configuration.
 - Different suites trade CPU cost, hardware acceleration, and cryptographic preferences.
 - They provide agility when some algorithms become weak or undesirable.
+
+### How Cipher Suites Relate to Symmetric Keys
+
+Cipher suites do not directly carry the symmetric keys themselves. Instead, they define the algorithms that will **use** and **shape** those keys.
+
+In TLS 1.3, a cipher suite mainly determines:
+
+1. which AEAD algorithm protects records
+2. which hash function is used in the HKDF key schedule
+
+Examples:
+
+- `TLS_AES_128_GCM_SHA256`
+    - record encryption: AES-128-GCM
+    - key schedule hash: SHA-256
+    - symmetric key size: 128-bit AES key
+
+- `TLS_AES_256_GCM_SHA384`
+    - record encryption: AES-256-GCM
+    - key schedule hash: SHA-384
+    - symmetric key size: 256-bit AES key
+
+- `TLS_CHACHA20_POLY1305_SHA256`
+    - record encryption: ChaCha20-Poly1305
+    - key schedule hash: SHA-256
+    - symmetric key material sized for ChaCha20
+
+So the negotiated cipher suite influences:
+
+- the length of derived write keys
+- the AEAD algorithm used to encrypt/decrypt records
+- the HKDF hash used to derive traffic secrets
+
+It does **not** mean the cipher suite alone is enough; the actual keys are still derived from ECDHE/PSK plus transcript state.
 
 ### Deep Dive: What Is in key_share?
 
@@ -612,6 +731,24 @@ After this step, bytes are application payloads such as:
 - HTTP/2 frames
 
 The same TLS record machinery is used, but the content semantics change.
+
+### Example: How Symmetric Keys Protect a Client Record
+
+Assume the handshake selected:
+
+- cipher suite: `TLS_AES_128_GCM_SHA256`
+- client write key: 16-byte AES key
+- client write IV: 12-byte static IV
+- current client record sequence number: `5`
+
+Then a conceptual record-send operation is:
+
+1. build inner plaintext: `HTTP bytes || content_type`
+2. derive per-record nonce from `client_write_iv` and sequence number `5`
+3. encrypt using AES-128-GCM and `client_write_key`
+4. send ciphertext in TLS record
+
+The server does the reverse using its matching read-side key/IV state.
 
 ## TLS Alerts During Handshake
 
