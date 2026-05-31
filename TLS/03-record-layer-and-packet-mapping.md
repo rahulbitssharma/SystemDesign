@@ -42,6 +42,12 @@ Relevant TCP fields:
 - window size
 - options (MSS, SACK, timestamps)
 
+Important note:
+
+- TCP has no field that explicitly says "this payload is TLS".
+- TCP treats payload as opaque bytes.
+- TLS is usually inferred from port conventions (for example `443`) and/or by parsing the payload as TLS record bytes.
+
 Conceptual packet view:
 
 ```text
