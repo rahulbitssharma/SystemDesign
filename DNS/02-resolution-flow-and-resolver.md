@@ -721,6 +721,8 @@ Notes:
 
 This table summarizes the common full handshake path (without client certificate authentication).
 
+For a full TLS-focused deep dive, see [TLS Chapter Index](../TLS/README.md) and [TLS 1.3 Handshake Transcript (Detailed)](../TLS/02-tls13-handshake-transcript.md).
+
 | Order | Sender | Handshake Message | Main Attributes | Security Contribution |
 |---|---|---|---|---|
 | 1 | Client | ClientHello | `supported_versions`, `cipher_suites`, `key_share`, `signature_algorithms`, `server_name` (SNI), `alpn` | Proposes capabilities and ephemeral key share; identifies intended hostname; starts key agreement. |
@@ -738,6 +740,8 @@ Important details:
 - The certificate is transmitted in the handshake, but protected after handshake keys are available.
 - Perfect forward secrecy is provided by ephemeral key exchange (`key_share` / ECDHE).
 - Session resumption can use PSK tickets to reduce latency on later connections.
+
+Go to [TLS Chapter](../TLS/README.md) for detailed coverage of handshake internals and record-layer packet mapping.
 
 ## Mapping HTTPS Internals to DoH
 
