@@ -10,6 +10,63 @@ TLS 1.3 does three jobs during handshake:
 2. Authenticates endpoint identity (usually server identity).
 3. Derives symmetric keys for encrypted application data.
 
+The easiest way to reason about TLS 1.3 is to separate four questions:
+
+1. What bytes are sent in each handshake message?
+2. What security decision is each message enabling?
+3. What state does each side derive after receiving that message?
+4. Which later failures can be traced back to a mistake in that stage?
+
+## Key Schedule Overview
+
+TLS 1.3 uses HKDF to derive successive secrets from a small number of core inputs.
+
+At a high level, the flow is:
+
+1. Start from an initial secret (or PSK if resuming).
+2. Mix in ECDHE shared secret.
+3. Derive handshake traffic secrets.
+4. Derive finished keys.
+5. Derive application traffic secrets.
+6. Optionally derive resumption secrets/tickets.
+
+Conceptual derivation chain:
+
+```text
+early_secret
+  -> handshake_secret = HKDF-Extract(early_secret, ecdhe_secret)
+  -> client_handshake_traffic_secret
+  -> server_handshake_traffic_secret
+  -> client_finished_key / server_finished_key
+  -> master_secret
+  -> client_application_traffic_secret_0
+  -> server_application_traffic_secret_0
+  -> exporter_secret / resumption_master_secret
+```
+
+### Pseudo-Code: HKDF-Style Key Schedule
+
+```python
+def derive_tls13_secrets(psk, ecdhe_secret, transcript_hashes):
+    early_secret = hkdf_extract(salt=zeros(), ikm=psk or zeros())
+    handshake_secret = hkdf_extract(
+        salt=derive_secret(early_secret, "derived", empty_hash()),
+        ikm=ecdhe_secret,
+    )
+
+    client_hs = derive_secret(handshake_secret, "c hs traffic", transcript_hashes["server_hello"])
+    server_hs = derive_secret(handshake_secret, "s hs traffic", transcript_hashes["server_hello"])
+
+    master_secret = hkdf_extract(
+        salt=derive_secret(handshake_secret, "derived", empty_hash()),
+        ikm=zeros(),
+    )
+
+    client_app = derive_secret(master_secret, "c ap traffic", transcript_hashes["finished"])
+    server_app = derive_secret(master_secret, "s ap traffic", transcript_hashes["finished"])
+    return client_hs, server_hs, client_app, server_app
+```
+
 ## Handshake Timeline (No Client Certificate)
 
 | Order | Sender | Message | Primary Purpose |
@@ -88,6 +145,102 @@ def init_tls_context(server_name: str):
 - `alpn`: desired application protocols.
 - Optional: PSK binders for resumption.
 
+### Why Each Attribute Exists
+
+- `legacy_version`: kept for compatibility with older parsers; TLS 1.3 version negotiation really happens in `supported_versions`.
+- `random`: contributes entropy and uniqueness to transcript and key schedule.
+- `cipher_suites`: tells server which authenticated encryption and hash combinations client can use.
+- `key_share`: supplies ephemeral public key material so server can immediately continue key agreement.
+- `signature_algorithms`: constrains what signature types are acceptable in certificates and `CertificateVerify`.
+- `server_name` (SNI): tells multi-tenant endpoints which certificate/site configuration to use.
+- `alpn`: lets client and server agree on application protocol such as `h2` versus `http/1.1`.
+
+### Common Extension Examples
+
+Typical ClientHello extensions in real deployments:
+
+- `supported_versions`: `TLS1.3`, `TLS1.2`
+- `key_share`: `x25519`, sometimes `secp256r1`
+- `supported_groups`: which ECDHE groups are acceptable
+- `signature_algorithms`: signature types acceptable for cert validation
+- `server_name`: `www.example.com`
+- `alpn`: `h2`, `http/1.1`
+- `status_request`: OCSP stapling support request
+- `psk_key_exchange_modes`: if resumption is in play
+
+### C-Style Pseudo-Code: Building ClientHello Configuration
+
+```c
+tls_client_config_t cfg = {0};
+cfg.server_name = "www.example.com";
+cfg.supported_versions[0] = TLS_VERSION_1_3;
+cfg.cipher_suites[0] = TLS_AES_128_GCM_SHA256;
+cfg.cipher_suites[1] = TLS_CHACHA20_POLY1305_SHA256;
+cfg.groups[0] = TLS_GROUP_X25519;
+cfg.groups[1] = TLS_GROUP_SECP256R1;
+cfg.sigalgs[0] = TLS_SIGALG_RSA_PSS_RSAE_SHA256;
+cfg.sigalgs[1] = TLS_SIGALG_ECDSA_SECP256R1_SHA256;
+cfg.alpn[0] = "h2";
+cfg.alpn[1] = "http/1.1";
+```
+
+### Deep Dive: What Is a Cipher Suite?
+
+A cipher suite is the negotiated cryptographic recipe for protecting the connection.
+
+In TLS 1.3, a cipher suite mostly chooses:
+
+- AEAD algorithm for record protection
+- Hash function used in HKDF-based key schedule
+
+Examples:
+
+- `TLS_AES_128_GCM_SHA256`
+- `TLS_AES_256_GCM_SHA384`
+- `TLS_CHACHA20_POLY1305_SHA256`
+
+Why cipher suites are useful:
+
+- They let both peers agree on one interoperable security configuration.
+- Different suites trade CPU cost, hardware acceleration, and cryptographic preferences.
+- They provide agility when some algorithms become weak or undesirable.
+
+### Deep Dive: What Is in key_share?
+
+`key_share` carries ephemeral public keys for one or more supported groups.
+
+Examples of groups:
+
+- `x25519`
+- `secp256r1`
+
+Why it matters:
+
+- It enables ephemeral Diffie-Hellman key agreement.
+- It is the basis for forward secrecy: compromise of long-term certificate keys later should not reveal prior session traffic.
+
+### Packet / Message Shape (Conceptual)
+
+Inside the TLS handshake transcript, ClientHello conceptually contains:
+
+```text
+HandshakeType: ClientHello
+legacy_version
+random
+legacy_session_id
+cipher_suites[]
+compression_methods
+extensions {
+    supported_versions
+    key_share
+    signature_algorithms
+    server_name
+    alpn
+    psk_key_exchange_modes?
+    pre_shared_key?
+}
+```
+
 ### Pseudo-Code: Build and Send ClientHello
 
 ```python
@@ -112,6 +265,52 @@ def send_client_hello(conn, ctx):
 - Selected cipher suite.
 - Selected key share (ECDHE response).
 - Optional selected PSK identity (resumption path).
+
+### Why These Attributes Matter
+
+- Selected version finalizes protocol generation.
+- Selected cipher suite locks in record protection and key-schedule hash.
+- Selected key share completes the ECDHE key exchange.
+- PSK identity, if present, ties the handshake to a prior session ticket/resumption state.
+
+### Packet / Message Shape (Conceptual)
+
+```text
+HandshakeType: ServerHello
+legacy_version
+random
+legacy_session_id_echo
+cipher_suite
+compression_method
+extensions {
+    supported_versions
+    key_share
+    pre_shared_key?
+}
+```
+
+### After ServerHello: What State Changes?
+
+After both sides process ServerHello:
+
+- shared ECDHE secret exists
+- handshake traffic secrets can be derived
+- subsequent handshake messages are encrypted in TLS 1.3
+
+### C-Style Pseudo-Code: Deriving Shared Secret After ServerHello
+
+```c
+ecdhe_secret_t shared = ecdhe_compute_shared_secret(
+    client_ephemeral_private_key,
+    server_key_share.public_key
+);
+
+tls_handshake_keys_t hs_keys = tls13_derive_handshake_keys(
+    client_hello_bytes,
+    server_hello_bytes,
+    shared
+);
+```
 
 ### Security Effect
 
@@ -141,6 +340,23 @@ def recv_server_hello_and_derive_hs(conn, ctx, ch):
 - Negotiated ALPN value.
 - Negotiated extension outputs (for example server-side constraints).
 
+### What Typically Appears Here?
+
+- selected ALPN protocol (`h2`, `http/1.1`)
+- server-supported extension values
+- protocol behavior flags not directly tied to certificate material
+
+Why it exists:
+
+- TLS 1.3 moved many server negotiation details into an encrypted message.
+- This reduces metadata exposure compared with older handshake layouts.
+
+Examples:
+
+- `alpn = h2`
+- `max_fragment_length` style negotiated behavior if supported
+- server confirmation of optional negotiated extensions
+
 ### Pseudo-Code: Process EncryptedExtensions
 
 ```python
@@ -157,6 +373,96 @@ def process_encrypted_extensions(conn, hs_keys):
 
 - Certificate chain (leaf + intermediates, sometimes stapled data/extensions).
 - Extensions bound to certificate message context.
+
+### What Is a Certificate Chain?
+
+A certificate chain is the ordered set of certificates used to prove that the server's presented identity can be linked to a trusted root.
+
+Typical chain shape:
+
+1. Leaf certificate: identity for `www.example.com`
+2. Intermediate CA certificate: issuer of the leaf
+3. Another intermediate CA certificate if required
+4. Trusted root CA: usually already in client trust store, often not sent on wire
+
+Concrete conceptual example:
+
+1. `CN=www.example.com`
+2. `CN=Example Issuing CA 1`
+3. `CN=Example Public Intermediate`
+4. `CN=Example Root CA` (trusted locally)
+
+Another common web PKI example shape:
+
+1. `www.service.com` leaf
+2. `R3` intermediate
+3. `ISRG Root X1` root in trust store
+
+Enterprise/private PKI example shape:
+
+1. `api.corp.internal` leaf
+2. `Corp Issuing CA 4`
+3. `Corp Root CA` installed in managed device trust store
+
+### What Is Actually Sent on the Wire?
+
+Usually the server sends:
+
+- leaf certificate
+- one or more intermediates
+
+Usually the server does **not** send:
+
+- root certificate already expected to exist in client trust store
+
+### Why Intermediates Exist
+
+Intermediates let operators keep the high-value root CA key offline while delegated issuing CAs sign endpoint certificates.
+
+### What the Client Actually Verifies
+
+- Issuer/subject linkage between chain elements
+- Signature validity at each step
+- Leaf identity matches requested hostname
+- Validity timestamps (`notBefore`, `notAfter`)
+- Key usage / extended key usage
+- Trust anchor exists in local trust store
+
+### Example Validation Failure Modes
+
+- leaf cert expired yesterday
+- SAN does not include requested hostname
+- intermediate missing or wrong issuer
+- root not trusted by client
+- certificate allowed for email signing but not TLS server auth
+
+### C-Style Pseudo-Code: Certificate Path Validation
+
+```c
+cert_chain_t chain = tls_get_peer_certificate_chain(session);
+
+cert_path_t path = cert_build_path(chain, trust_store);
+if (!path.ok) fail("path build failed");
+
+if (!cert_verify_time(path.leaf, now())) fail("expired or not yet valid");
+if (!cert_verify_hostname(path.leaf, "www.example.com")) fail("hostname mismatch");
+if (!cert_verify_key_usage(path.leaf, CERT_USAGE_TLS_SERVER)) fail("bad key usage");
+if (!cert_verify_signatures(path)) fail("bad chain signature");
+```
+
+### Packet / Message Shape (Conceptual)
+
+```text
+HandshakeType: Certificate
+certificate_request_context
+certificate_list {
+    cert_data (leaf)
+    cert_extensions
+    cert_data (intermediate 1)
+    cert_extensions
+    ...
+}
+```
 
 ### Validation Checks
 
@@ -185,6 +491,29 @@ def validate_server_certificate(cert_msg, server_name, trust_store):
 - Signature algorithm chosen by server.
 - Signature over transcript hash with TLS-specific context string.
 
+### Why Certificate Alone Is Not Enough
+
+The certificate only gives the public key and identity binding. The client still needs proof that the server actually controls the corresponding private key.
+
+`CertificateVerify` provides that proof by signing the handshake transcript context.
+
+### What Is Signed?
+
+Conceptually:
+
+```text
+signature_input =
+    TLS13_CONTEXT_STRING || 0x00 || Transcript-Hash(all prior handshake messages)
+```
+
+This prevents replay or cross-protocol misuse of signatures.
+
+### Example Signature Algorithms Seen Here
+
+- `rsa_pss_rsae_sha256`
+- `ecdsa_secp256r1_sha256`
+- `rsa_pss_rsae_sha384`
+
 ### Security Effect
 
 - Proves server controls private key for leaf certificate.
@@ -208,6 +537,24 @@ def verify_certificate_verify(cv_msg, transcript_hash, leaf_public_key):
 
 - HMAC over transcript using server finished key.
 
+### Why Finished Matters Even After CertificateVerify
+
+`CertificateVerify` proves private-key possession.
+`Finished` proves both sides derived the same handshake secrets and saw the same transcript bytes.
+
+It is the handshake integrity lock.
+
+### Alert Behavior on Failure
+
+If a peer cannot validate the handshake state, it typically sends a fatal alert and closes the connection.
+
+Examples:
+
+- `bad_certificate`
+- `decrypt_error`
+- `handshake_failure`
+- `unexpected_message`
+
 ### Security Effect
 
 - Commits all handshake bytes seen so far.
@@ -230,6 +577,12 @@ def verify_server_finished(fin_msg, transcript_hash, hs_keys):
 
 - HMAC over transcript using client finished key.
 
+### What the Server Learns from Client Finished
+
+- client derived the same handshake secret
+- client accepted the handshake transcript
+- connection can now safely transition to application traffic keys
+
 ### Pseudo-Code: Build and Send Client Finished
 
 ```python
@@ -248,6 +601,74 @@ def send_client_finished(conn, transcript_hash, hs_keys):
 
 - Encrypted TLS records containing application payload bytes.
 - Record protection via AEAD keys and nonces.
+
+### What Changes at This Boundary?
+
+Before this step, bytes are handshake messages.
+After this step, bytes are application payloads such as:
+
+- HTTP request headers/body
+- HTTP response headers/body
+- HTTP/2 frames
+
+The same TLS record machinery is used, but the content semantics change.
+
+## TLS Alerts During Handshake
+
+Alerts are small protocol messages used to signal errors or closure.
+
+Common alert descriptions in handshake troubleshooting:
+
+- `close_notify`: orderly shutdown
+- `unexpected_message`: peer received a message not valid in current state
+- `bad_record_mac`: integrity failure on record
+- `handshake_failure`: negotiation could not complete
+- `certificate_unknown`: certificate rejected for policy/trust reasons
+- `unknown_ca`: issuing CA not trusted
+- `protocol_version`: no mutually supported TLS version
+
+### Pseudo-Code: Fail Handshake with Alert
+
+```python
+def fail_handshake(conn, alert_desc):
+    alert = build_tls_alert(level="fatal", description=alert_desc)
+    conn.send_encrypted_alert(alert)
+    conn.close()
+```
+
+### C-Style Pseudo-Code: Alert-Oriented Error Path
+
+```c
+if (!cert_verify_hostname(path.leaf, expected_host)) {
+    tls_send_fatal_alert(session, TLS_ALERT_BAD_CERTIFICATE);
+    tls_close(session);
+    return ERR_HOSTNAME_MISMATCH;
+}
+```
+
+## Handshake Message Framing on the Wire
+
+Handshake messages themselves are carried inside TLS records.
+
+Typical early flow over TCP looks like this:
+
+```text
+TCP stream
+    -> TLSPlaintext record carrying ClientHello
+    -> TLSPlaintext / TLSCiphertext carrying ServerHello
+    -> TLSCiphertext carrying EncryptedExtensions
+    -> TLSCiphertext carrying Certificate
+    -> TLSCiphertext carrying CertificateVerify
+    -> TLSCiphertext carrying Finished
+    -> TLSCiphertext carrying client Finished
+    -> TLSCiphertext carrying application data
+```
+
+Important nuance:
+
+- one handshake message can span multiple records
+- multiple small handshake messages can appear inside a small set of records
+- TCP segmentation is independent of TLS message boundaries
 
 ### Pseudo-Code: Transition to Application Data
 
@@ -346,6 +767,83 @@ When a handshake fails, isolate by stage:
 2. Certificate stage: chain/hostname/trust/revocation errors.
 3. `Finished` failure: transcript mismatch or key schedule bug.
 4. Post-handshake failures: record protection/key update/session ticket issues.
+
+## C-Style Pseudo-Code: Browser-Managed TLS Handshake
+
+This is the common architecture where the application owns the TCP socket and drives a user-space TLS library.
+
+```c
+int fd = socket(AF_INET, SOCK_STREAM, 0);
+connect(fd, (struct sockaddr *)&server_addr, sizeof(server_addr));
+
+SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+SSL *ssl = SSL_new(ctx);
+
+SSL_set_tlsext_host_name(ssl, "www.example.com");
+SSL_set_fd(ssl, fd);
+
+int ret = SSL_connect(ssl);  // drives ClientHello -> Finished sequence
+if (ret <= 0) {
+    /* inspect SSL_get_error(ssl, ret) */
+}
+
+ret = SSL_write(ssl, http_request_bytes, http_request_len);
+ret = SSL_read(ssl, response_buf, sizeof(response_buf));
+```
+
+What happens underneath:
+
+1. application creates TCP socket via OS
+2. TLS library writes handshake bytes to that socket
+3. OS sends TCP/IP packets
+4. incoming encrypted bytes are read from socket into TLS library
+5. TLS library decrypts and returns plaintext to application
+
+### C-Style Pseudo-Code: Explicit Handshake Drive Loop
+
+```c
+while (!tls_is_connected(tls)) {
+    uint8_t network_out[16384];
+    size_t produced = tls_handshake_step(tls, network_out, sizeof(network_out));
+    if (produced > 0) {
+        send(fd, network_out, produced, 0);
+    }
+
+    uint8_t network_in[16384];
+    int n = recv(fd, network_in, sizeof(network_in), 0);
+    if (n < 0) {
+        return ERR_SOCKET_RECV;
+    }
+    tls_feed_network_bytes(tls, network_in, (size_t)n);
+}
+```
+
+## C-Style Pseudo-Code: Application Using OS TLS API
+
+Some applications rely on platform TLS APIs rather than bundling their own TLS stack.
+
+```c
+int fd = socket(AF_INET, SOCK_STREAM, 0);
+connect(fd, (struct sockaddr *)&server_addr, sizeof(server_addr));
+
+os_tls_context_t *tls = os_tls_context_create();
+os_tls_set_server_name(tls, "www.example.com");
+os_tls_attach_socket(tls, fd);
+
+int ret = os_tls_handshake(tls);
+if (ret != 0) {
+    /* inspect platform-specific status */
+}
+
+os_tls_write(tls, http_request_bytes, http_request_len);
+int n = os_tls_read(tls, response_buf, sizeof(response_buf));
+```
+
+Interpretation:
+
+- OS transport still owns the socket and TCP/IP path.
+- Platform TLS API may present plaintext read/write functions to the application.
+- HTTP parsing still happens in application/browser code after plaintext is returned.
 
 ---
 
