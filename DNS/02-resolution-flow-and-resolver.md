@@ -398,6 +398,64 @@ Who implements what:
 - Browser/app TLS stack (or platform TLS library): handshake logic, certificate validation, key schedule, record encryption/decryption.
 - Application protocol layer: HTTP semantics (methods, headers, bodies).
 
+### Implementation Reality and Exceptions
+
+In most browser deployments, the OS kernel does **not** parse HTTP or perform full TLS handshake logic on behalf of the browser. A more precise model is:
+
+1. Kernel reliably owns IP/TCP transport and socket I/O.
+2. TLS handshake and certificate validation are usually done in user space (browser TLS library or platform TLS API).
+3. HTTP parsing is done by browser/networking code after plaintext is available to that process.
+
+Common implementation patterns:
+
+- Browser-managed TLS: browser ships/uses its own TLS stack and validates certs in process.
+- Platform TLS API: browser/app calls OS security API from user space; still not "kernel gives parsed HTTP" by default.
+- Kernel TLS/NIC offload (advanced path): kernel or hardware may handle record encryption/decryption after handshake secrets are provisioned.
+
+Practical conclusion:
+
+- "OS implements networking" is always true for IP/TCP transport.
+- "OS decrypts and returns HTTP to browser" is only true in specific offload/integration paths, not the default assumption.
+
+### Browser Implementation Examples
+
+Concrete examples from common browser ecosystems:
+
+- Chromium/Chrome family commonly uses BoringSSL as the TLS library in browser/runtime stack.
+- Firefox uses NSS (Network Security Services) for TLS and certificate handling.
+
+Why these examples matter:
+
+- They illustrate that major browsers typically carry user-space TLS implementations.
+- Kernel networking still provides socket/IP/TCP transport beneath those TLS stacks.
+- Platform APIs and kernel/offload integrations may exist, but are treated as implementation choices, not universal defaults.
+
+### Pseudo-Code: TLS Runtime Ownership Model
+
+```python
+def https_runtime_path(app, os_stack, conn):
+	# Transport setup is always OS/kernel territory.
+	sock = os_stack.tcp_connect(conn.remote_ip, 443)
+
+	if app.uses_browser_tls_library:
+		# Typical browser path: user-space TLS handshake and cert validation.
+		tls_ctx = app.tls.handshake(sock, server_name=conn.host)
+		app.tls.verify_certificate_chain(tls_ctx, expected_host=conn.host)
+		return "userspace_tls_record_layer"
+
+	if app.uses_platform_tls_api:
+		# OS API may be used from user space, but app still owns HTTP semantics.
+		tls_ctx = os_stack.platform_tls.handshake(sock, server_name=conn.host)
+		return "platform_userspace_tls"
+
+	if os_stack.ktls_enabled and app.provisions_session_keys:
+		# Exception path: data record encryption/decryption can move into kernel/NIC.
+		os_stack.ktls.install_tx_rx_keys(sock, conn.session_keys)
+		return "kernel_or_nic_tls_datapath"
+
+	return "implementation_specific"
+```
+
 ## HTTPS Packet Format
 
 For HTTP/2 over TLS over TCP, packets are conceptually layered as:
