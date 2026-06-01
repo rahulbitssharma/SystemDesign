@@ -71,6 +71,29 @@ The critical inputs are:
 
 This means the symmetric traffic keys are not randomly chosen in isolation; they are deterministically derived from handshake inputs and shared secrets.
 
+### Clarification: Exactly How `key_share` Produces the ECDH Secret
+
+`key_share` itself is not the shared secret. It carries ephemeral **public** keys plus group identifiers.
+
+What each side contributes:
+
+- ClientHello `key_share`: `(group, client_ephemeral_public_key)`
+- ServerHello `key_share`: `(group, server_ephemeral_public_key)`
+
+What each side keeps local (never sent):
+
+- client ephemeral private key
+- server ephemeral private key
+
+How the shared secret is computed:
+
+- client computes `ECDH(client_ephemeral_private_key, server_ephemeral_public_key)`
+- server computes `ECDH(server_ephemeral_private_key, client_ephemeral_public_key)`
+
+Both computations yield the same `ecdhe_secret`, which is then input to HKDF in the TLS 1.3 key schedule.
+
+So `key_share` is the transport container for public ECDHE material; the actual shared secret is computed locally from private+peer-public key pairs.
+
 ### Clarification: "PSK or Zero Input" Means
 
 - If session resumption/external PSK is used, the key schedule starts from that PSK material.
@@ -82,6 +105,12 @@ This means the symmetric traffic keys are not randomly chosen in isolation; they
 - ECDHE is the key-agreement method, not the final shared secret value itself.
 - Client and server exchange ephemeral public keys.
 - Each side computes the same ECDHE shared secret locally from its own ephemeral private key and the peer's ephemeral public key.
+
+Full definition:
+
+- `ECDHE` = Elliptic Curve Diffie-Hellman Ephemeral.
+- Elliptic Curve Diffie-Hellman: key agreement on an elliptic-curve group (for example `x25519`, `secp256r1`).
+- Ephemeral: each side uses fresh, temporary key pairs per handshake rather than long-term static key-agreement keys.
 
 Conceptually:
 
@@ -224,6 +253,275 @@ sequenceDiagram
     C->>S: ApplicationData
     S-->>C: ApplicationData
 ```
+
+## How the Client Authenticates the Server (End-to-End)
+
+In TLS 1.3, server authentication is not one single check; it is a chain of checks across multiple messages:
+
+1. `Certificate`: client validates chain to trusted root, validity time, key usage, and hostname.
+2. `CertificateVerify`: client verifies signature over transcript context using leaf cert public key, proving server controls the corresponding private key.
+3. `Finished`: client verifies transcript-bound MAC with server handshake secret, proving handshake integrity and key-schedule consistency.
+
+Why this matters:
+
+- Certificate validation alone proves identity binding, but not active private-key possession.
+- `CertificateVerify` proves possession, but `Finished` is still needed to detect transcript tampering and handshake state mismatch.
+- Authentication should be treated as complete only after all three checks pass.
+
+If any check fails, client must abort handshake with a fatal alert.
+
+## End-to-End Pseudo-Code: Detailed TLS 1.3 Handshake Driver
+
+This version expands the full sequence into explicit steps so the transcript, key schedule, and authentication checks are visible in one place.
+
+```python
+class TranscriptHash:
+    def __init__(self, hash_name):
+        self.hash_name = hash_name
+        self.state = hash_init(hash_name)
+
+    def update_message(self, handshake_msg_bytes):
+        # Hash the handshake encoding, not the TLS record wrapper.
+        self.state = hash_update(self.state, handshake_msg_bytes)
+
+    def digest(self):
+        return hash_finalize(self.state)
+
+
+def hkdf_extract(salt, ikm):
+    return hmac_hash(salt, ikm)
+
+
+def hkdf_expand_label(secret, label, context, length):
+    tls_label = b"tls13 " + label.encode("ascii")
+    info = build_hkdf_label(length, tls_label, context)
+    return hkdf_expand(secret, info, length)
+
+
+def derive_secret(secret, label, transcript_hash, hash_len):
+    return hkdf_expand_label(secret, label, transcript_hash, hash_len)
+
+
+def derive_tls13_key_schedule(psk, ecdhe_secret, hash_name, handshake_transcript_hash):
+    hash_len = hash_length(hash_name)
+    zero_salt = bytes(hash_len)
+    empty_hash = hash_finalize(hash_init(hash_name))
+
+    early_secret = hkdf_extract(zero_salt, psk or bytes(hash_len))
+    derived_early = derive_secret(early_secret, "derived", empty_hash, hash_len)
+
+    handshake_secret = hkdf_extract(derived_early, ecdhe_secret)
+    client_hs_traffic_secret = derive_secret(
+        handshake_secret,
+        "c hs traffic",
+        handshake_transcript_hash,
+        hash_len,
+    )
+    server_hs_traffic_secret = derive_secret(
+        handshake_secret,
+        "s hs traffic",
+        handshake_transcript_hash,
+        hash_len,
+    )
+
+    derived_hs = derive_secret(handshake_secret, "derived", empty_hash, hash_len)
+    master_secret = hkdf_extract(derived_hs, bytes(hash_len))
+
+    return {
+        "early_secret": early_secret,
+        "handshake_secret": handshake_secret,
+        "client_hs_traffic_secret": client_hs_traffic_secret,
+        "server_hs_traffic_secret": server_hs_traffic_secret,
+        "master_secret": master_secret,
+    }
+
+
+def derive_record_keys(traffic_secret, key_len, iv_len):
+    return {
+        "key": hkdf_expand_label(traffic_secret, "key", b"", key_len),
+        "iv": hkdf_expand_label(traffic_secret, "iv", b"", iv_len),
+    }
+
+
+def derive_finished_key(traffic_secret, hash_len):
+    return hkdf_expand_label(traffic_secret, "finished", b"", hash_len)
+
+
+def derive_application_traffic_secrets(master_secret, transcript_hash, hash_name):
+    hash_len = hash_length(hash_name)
+    return {
+        "client_app_traffic_secret_0": derive_secret(
+            master_secret,
+            "c ap traffic",
+            transcript_hash,
+            hash_len,
+        ),
+        "server_app_traffic_secret_0": derive_secret(
+            master_secret,
+            "s ap traffic",
+            transcript_hash,
+            hash_len,
+        ),
+    }
+
+
+def verify_certificate_chain(cert_msg, server_name, trust_store):
+    chain = cert_msg.certificate_chain
+    path = build_certificate_path(chain, trust_store)
+    verify_time_validity(path)
+    verify_key_usage_and_policies(path)
+    verify_hostname(path.leaf, expected_host=server_name)
+    verify_revocation_if_enabled(path)
+    return path
+
+
+def build_certificate_verify_context(transcript_hash, role):
+    # TLS 1.3 signs a structured context string plus the transcript hash.
+    if role == "server":
+        prefix = b"TLS 1.3, server CertificateVerify"
+    else:
+        prefix = b"TLS 1.3, client CertificateVerify"
+    return b" " * 64 + prefix + b"\x00" + transcript_hash
+
+
+def verify_certificate_verify(cv_msg, transcript_hash, leaf_public_key):
+    context = build_certificate_verify_context(transcript_hash, role="server")
+    return verify_signature(
+        public_key=leaf_public_key,
+        algorithm=cv_msg.algorithm,
+        message=context,
+        signature=cv_msg.signature,
+    )
+
+
+def verify_finished(fin_msg, transcript_hash, finished_key):
+    expected = hmac_finished(
+        base_key=finished_key,
+        transcript_hash=transcript_hash,
+    )
+    return constant_time_equal(fin_msg.verify_data, expected)
+
+
+def tls13_handshake(conn, server_name):
+    ctx = init_tls_context(server_name)
+
+    # 1) Client sends ClientHello with supported versions, cipher suites, and key shares.
+    client_hello = send_client_hello(conn, ctx)
+    transcript = TranscriptHash(ctx.hash_name)
+    transcript.update_message(client_hello.serialize_handshake_bytes())
+
+    # 2) Server replies with ServerHello and key-share selection.
+    server_hello = ServerHello.parse(conn.recv())
+    transcript.update_message(server_hello.serialize_handshake_bytes())
+
+    # 3) Both sides compute the ECDHE shared secret from their local private key and peer public key.
+    client_private_key = client_hello.find_private_for_group(server_hello.key_share.group)
+    ecdhe_secret = ecdhe_shared_secret(
+        client_private_key=client_private_key,
+        server_public_key=server_hello.key_share.public_key,
+    )
+
+    # 4) TLS 1.3 key schedule derives handshake secrets from ECDHE plus the transcript state.
+    handshake_transcript_hash = transcript.digest()
+    secrets = derive_tls13_key_schedule(
+        psk=ctx.psk,
+        ecdhe_secret=ecdhe_secret,
+        hash_name=ctx.hash_name,
+        handshake_transcript_hash=handshake_transcript_hash,
+    )
+    server_hs_keys = derive_record_keys(
+        secrets["server_hs_traffic_secret"],
+        key_len=ctx.key_len,
+        iv_len=ctx.iv_len,
+    )
+    client_hs_keys = derive_record_keys(
+        secrets["client_hs_traffic_secret"],
+        key_len=ctx.key_len,
+        iv_len=ctx.iv_len,
+    )
+    server_finished_key = derive_finished_key(secrets["server_hs_traffic_secret"], ctx.hash_len)
+    client_finished_key = derive_finished_key(secrets["client_hs_traffic_secret"], ctx.hash_len)
+
+    # 5) Server sends encrypted handshake messages under handshake traffic keys.
+    encrypted_extensions_bytes = conn.recv_decrypt(server_hs_keys["key"], server_hs_keys["iv"])
+    encrypted_extensions = EncryptedExtensions.parse(encrypted_extensions_bytes)
+    transcript.update_message(encrypted_extensions.serialize_handshake_bytes())
+
+    certificate_bytes = conn.recv_decrypt(server_hs_keys["key"], server_hs_keys["iv"])
+    certificate_msg = Certificate.parse(certificate_bytes)
+    transcript.update_message(certificate_msg.serialize_handshake_bytes())
+
+    certificate_verify_bytes = conn.recv_decrypt(server_hs_keys["key"], server_hs_keys["iv"])
+    certificate_verify_msg = CertificateVerify.parse(certificate_verify_bytes)
+    cert_verify_hash = transcript.digest()
+
+    server_finished_bytes = conn.recv_decrypt(server_hs_keys["key"], server_hs_keys["iv"])
+    server_finished_msg = Finished.parse(server_finished_bytes)
+
+    # 6) Client validates the certificate chain and hostname against local trust policy.
+    path = verify_certificate_chain(certificate_msg, server_name, ctx.trust_store)
+
+    # 7) Client verifies the server's signature over the transcript.
+    verify_certificate_verify(
+        certificate_verify_msg,
+        cert_verify_hash,
+        path.leaf.public_key,
+    )
+
+    transcript.update_message(certificate_verify_msg.serialize_handshake_bytes())
+
+    # 8) Client verifies the server Finished MAC to confirm transcript and key-schedule agreement.
+    finished_hash = transcript.digest()
+    if not verify_finished(server_finished_msg, finished_hash, server_finished_key):
+        fail_handshake(conn, "decrypt_error")
+
+    transcript.update_message(server_finished_msg.serialize_handshake_bytes())
+
+    # 9) Client derives application traffic secrets and record-protection keys.
+    app_secrets = derive_application_traffic_secrets(
+        secrets["master_secret"],
+        transcript.digest(),
+        ctx.hash_name,
+    )
+    client_app_keys = derive_record_keys(
+        app_secrets["client_app_traffic_secret_0"],
+        key_len=ctx.key_len,
+        iv_len=ctx.iv_len,
+    )
+    server_app_keys = derive_record_keys(
+        app_secrets["server_app_traffic_secret_0"],
+        key_len=ctx.key_len,
+        iv_len=ctx.iv_len,
+    )
+
+    # 10) Client sends its Finished message using client handshake keys.
+    client_finished_hash = transcript.digest()
+    client_finished_verify_data = hmac_finished(
+        base_key=client_finished_key,
+        transcript_hash=client_finished_hash,
+    )
+    client_finished = Finished(verify_data=client_finished_verify_data)
+    conn.send_encrypt(
+        client_finished.serialize(),
+        client_hs_keys["key"],
+        client_hs_keys["iv"],
+    )
+
+    # 11) From here on, normal application data uses application traffic keys.
+    return {
+        "client_write_key": client_app_keys["key"],
+        "client_write_iv": client_app_keys["iv"],
+        "server_write_key": server_app_keys["key"],
+        "server_write_iv": server_app_keys["iv"],
+    }
+```
+
+Notes on the pseudocode above:
+
+- The transcript hash is cumulative and is updated with handshake bytes as they are processed.
+- The certificate chain is validated before trusting the public key in CertificateVerify.
+- The handshake traffic secret protects Certificate, CertificateVerify, Finished, and client Finished.
+- The application traffic secrets are derived only after the handshake secret is established, but they are only used for application data after authentication succeeds.
 
 ## Step 0: Client Handshake Initialization
 
